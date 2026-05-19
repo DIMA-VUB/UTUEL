@@ -169,39 +169,41 @@ class PipelineRunner:
         # slot and improving GPU utilisation.
         pending.sort(key=lambda t: len(t[1]))
 
-        # max_concurrency limits how many ainvoke() calls run at once
-        # via an internal asyncio.Semaphore — no manual chunking needed.
-        # All pending prompts are submitted; the semaphore ensures at
-        # most num_parallel are in-flight to the Ollama server at once.
-        prompts   = [p for _, p, _ in pending]
-        t0        = time.time()
-        responses = await llm.abatch(
-            prompts,
-            config={"max_concurrency": self.num_parallel},
-            return_exceptions=True,
-        )
-        elapsed = round(time.time() - t0, 2)
-
+        # Use a semaphore + individual ainvoke() calls so each result is
+        # written to disk immediately as it completes.  This means a crash
+        # mid-run loses at most one in-flight request, not the whole batch.
+        sem = asyncio.Semaphore(self.num_parallel)
         successes = 0
-        for (row_id, prompt, extra), response in zip(pending, responses):
-            if isinstance(response, Exception):
-                status, text = f"error: {response}", None
-            else:
-                status, text = "ok", response
-                successes += 1
+        lock = asyncio.Lock()
+        t0 = time.time()
 
-            # Each record carries its run number so multiple runs
-            # in the same file are always distinguishable.
-            _append_jsonl(out_path, {
-                "run":      run_num,
-                "dataset":  ds.name,
-                "row_id":   row_id,
-                "model":    ds.model,
-                "prompt":   prompt,
-                "response": text,
-                "status":   status,
-                **extra,
-            })
+        async def _invoke_and_write(row_id: int, prompt: str, extra: dict) -> None:
+            nonlocal successes
+            async with sem:
+                try:
+                    response = await llm.ainvoke(prompt)
+                    status, text = "ok", response
+                except Exception as exc:
+                    status, text = f"error: {exc}", None
+            async with lock:
+                if status == "ok":
+                    successes += 1
+                _append_jsonl(out_path, {
+                    "run":      run_num,
+                    "dataset":  ds.name,
+                    "row_id":   row_id,
+                    "model":    ds.model,
+                    "prompt":   prompt,
+                    "response": text,
+                    "status":   status,
+                    **extra,
+                })
+
+        await asyncio.gather(*[
+            _invoke_and_write(row_id, prompt, extra)
+            for row_id, prompt, extra in pending
+        ])
+        elapsed = round(time.time() - t0, 2)
 
         stats.record_batch(len(pending), successes)
         print(f"  {tag} ✓ {successes}/{len(pending)} ok  ({elapsed}s)")

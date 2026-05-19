@@ -42,7 +42,7 @@ datasets:
   
   - name: test_lookup_WikiSQL
     path: datasets/test_lookup_WikiSQL.jsonl
-    model: qwen3.6
+    model: qwen3.6:27b
     prompt_key: prompt
     prompt_template: prompts_pipeline/prompt_templates/prompt_test_lookup_WikiSQL.txt
 

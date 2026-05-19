@@ -11,7 +11,7 @@
 set -euo pipefail
 
 # ── config ────────────────────────────────────────────────────────────────────
-VENV_DIR="${VENV_DIR:-venv}"          # override: VENV_DIR=.venv bash run_pipeline.sh
+VENV_DIR="${VENV_DIR:-.venv}"         # override: VENV_DIR=venv bash run_pipeline.sh
 LOG_DIR="logs"
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 LOG_FILE="$LOG_DIR/pipeline_${TIMESTAMP}.log"
