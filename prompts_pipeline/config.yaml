@@ -26,49 +26,49 @@ datasets:
     path: datasets/test_lookup_WikiSQL.jsonl
     model: llama3
     prompt_key: prompt
-    prompt_template: prompts_pipeline/prompt_templates/lookup_WikiSQL.txt
+    prompt_template: prompts_pipeline/prompt_templates/prompt_test_lookup_WikiSQL.txt
 
   - name: test_lookup_WikiSQL
     path: datasets/test_lookup_WikiSQL.jsonl
     model: gemma2
     prompt_key: prompt
-    prompt_template: prompts_pipeline/prompt_templates/lookup_WikiSQL.txt
+    prompt_template: prompts_pipeline/prompt_templates/prompt_test_lookup_WikiSQL.txt
   
   - name: test_lookup_WikiSQL
     path: datasets/test_lookup_WikiSQL.jsonl
     model: tablellm-7b-Q4
     prompt_key: prompt
-    prompt_template: prompts_pipeline/prompt_templates/lookup_WikiSQL.txt
+    prompt_template: prompts_pipeline/prompt_templates/prompt_test_lookup_WikiSQL.txt
   
   - name: test_lookup_WikiSQL
     path: datasets/test_lookup_WikiSQL.jsonl
     model: qwen3.6
     prompt_key: prompt
-    prompt_template: prompts_pipeline/prompt_templates/lookup_WikiSQL.txt
+    prompt_template: prompts_pipeline/prompt_templates/prompt_test_lookup_WikiSQL.txt
 
   - name: test_lookup_WikiSQL
     path: datasets/test_lookup_WikiSQL.jsonl
     model: deepseek-r1
     prompt_key: prompt
-    prompt_template: prompts_pipeline/prompt_templates/lookup_WikiSQL.txt
+    prompt_template: prompts_pipeline/prompt_templates/prompt_test_lookup_WikiSQL.txt
 
   - name: test_lookup_WikiSQL
     path: datasets/test_lookup_WikiSQL.jsonl
     model: gemma4
     prompt_key: prompt
-    prompt_template: prompts_pipeline/prompt_templates/lookup_WikiSQL.txt
+    prompt_template: prompts_pipeline/prompt_templates/prompt_test_lookup_WikiSQL.txt
   
   - name: test_lookup_WikiSQL
     path: datasets/test_lookup_WikiSQL.jsonl
     model: TableGPT2-7B
     prompt_key: prompt
-    prompt_template: prompts_pipeline/prompt_templates/lookup_WikiSQL.txt
+    prompt_template: prompts_pipeline/prompt_templates/prompt_test_lookup_WikiSQL.txt
   
   - name: test_lookup_WikiSQL
     path: datasets/test_lookup_WikiSQL.jsonl
     model: gpt-oss
     prompt_key: prompt
-    prompt_template: prompts_pipeline/prompt_templates/lookup_WikiSQL.txt
+    prompt_template: prompts_pipeline/prompt_templates/prompt_test_lookup_WikiSQL.txt
 
 
 # ── Hydra settings ────────────────────────────────────────────────────────────
