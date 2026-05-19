@@ -1,0 +1,78 @@
+# ── Ollama server settings ────────────────────────────────────────────────────
+# These three values are exported as environment variables (Ollama reads them
+# at startup) and are also read directly by the pipeline runner so the code
+# always stays in sync with the server capacity.
+ollama:
+  num_parallel: 4          # OLLAMA_NUM_PARALLEL       ↑ raised from default 1
+  max_loaded_models: 4     # OLLAMA_MAX_LOADED_MODELS  adjust to your GPU count
+  max_queue: 4096          # OLLAMA_MAX_QUEUE          ↑ raised from default 512
+
+# ── Pipeline settings ─────────────────────────────────────────────────────────
+pipeline:
+  # How many independent runs to perform over every dataset.
+  # Each run writes to its own file: <name>_run<N>.jsonl
+  # Interrupted runs resume automatically on restart (already-written
+  # rows are detected by row_id and skipped).
+  num_runs: 1
+  # Chunk size and queue ceiling come from ollama.num_parallel / ollama.max_queue
+  # — no separate batch_size needed here.
+  # No timeout: requests can queue for a long time under high load;
+  # a hard deadline would turn valid slow responses into false errors.
+  ollama_base_url: http://localhost:11434
+
+# ── Datasets ─────────────────────────────────────────────────────────────────
+datasets:
+  - name: test_lookup_WikiSQL
+    path: datasets/test_lookup_WikiSQL.jsonl
+    model: llama3
+    prompt_key: prompt
+    prompt_template: prompt_templates/lookup_WikiSQL.txt
+
+  - name: test_lookup_WikiSQL
+    path: datasets/test_lookup_WikiSQL.jsonl
+    model: gemma2
+    prompt_key: prompt
+    prompt_template: prompt_templates/lookup_WikiSQL.txt
+  
+  - name: test_lookup_WikiSQL
+    path: datasets/test_lookup_WikiSQL.jsonl
+    model: tablellm-7b-Q4
+    prompt_key: prompt
+    prompt_template: prompt_templates/lookup_WikiSQL.txt
+  
+  - name: test_lookup_WikiSQL
+    path: datasets/test_lookup_WikiSQL.jsonl
+    model: qwen3.6
+    prompt_key: prompt
+    prompt_template: prompt_templates/lookup_WikiSQL.txt
+
+  - name: test_lookup_WikiSQL
+    path: datasets/test_lookup_WikiSQL.jsonl
+    model: deepseek-r1
+    prompt_key: prompt
+    prompt_template: prompt_templates/lookup_WikiSQL.txt
+
+  - name: test_lookup_WikiSQL
+    path: datasets/test_lookup_WikiSQL.jsonl
+    model: gemma4
+    prompt_key: prompt
+    prompt_template: prompt_templates/lookup_WikiSQL.txt
+  
+  - name: test_lookup_WikiSQL
+    path: datasets/test_lookup_WikiSQL.jsonl
+    model: TableGPT2-7B
+    prompt_key: prompt
+    prompt_template: prompt_templates/lookup_WikiSQL.txt
+  
+  - name: test_lookup_WikiSQL
+    path: datasets/test_lookup_WikiSQL.jsonl
+    model: gpt-oss
+    prompt_key: prompt
+    prompt_template: prompt_templates/lookup_WikiSQL.txt
+
+
+# ── Hydra settings ────────────────────────────────────────────────────────────
+hydra:
+  run:
+    dir: .          # keep cwd at project root (do not create outputs/)
+  output_subdir: null   # suppress the .hydra/ config-backup folder
