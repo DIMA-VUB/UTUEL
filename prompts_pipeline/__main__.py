@@ -10,6 +10,7 @@ Entry point — settings come from config.yml, overridable with dot-notation:
 
 import asyncio
 import os
+from pathlib import Path
 
 import hydra
 from omegaconf import DictConfig
@@ -17,7 +18,7 @@ from omegaconf import DictConfig
 from .runner import PipelineRunner, DatasetConfig
 
 
-@hydra.main(config_path=".", config_name="config", version_base=None)
+@hydra.main(config_path=str(Path(__file__).parent), config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
     # Export Ollama server environment variables so they take effect for any
     # subprocess (e.g. a locally spawned ollama serve).
