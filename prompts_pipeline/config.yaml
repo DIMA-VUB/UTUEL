@@ -3,7 +3,7 @@
 # at startup) and are also read directly by the pipeline runner so the code
 # always stays in sync with the server capacity.
 ollama:
-  num_parallel: 4          # OLLAMA_NUM_PARALLEL       ↑ raised from default 1
+  num_parallel: 16          # OLLAMA_NUM_PARALLEL       ↑ raised from default 1
   max_loaded_models: 4     # OLLAMA_MAX_LOADED_MODELS  adjust to your GPU count
   max_queue: 4096          # OLLAMA_MAX_QUEUE          ↑ raised from default 512
 
