@@ -10,6 +10,7 @@ num_parallel prompts are sent in-flight per model via abatch().
 
 import asyncio
 import json
+import sys
 import time
 import uuid
 from datetime import datetime
@@ -30,6 +31,11 @@ def _make_timestamp() -> str:
 def _append_jsonl(path: Path, obj: dict) -> None:
     with path.open("a", encoding="utf-8") as f:
         f.write(json.dumps(obj, ensure_ascii=False) + "\n")
+
+
+def _progress_bar(done: int, total: int, width: int = 20) -> str:
+    filled = int(width * done / total) if total else 0
+    return f"[{'█' * filled}{'░' * (width - filled)}] {done}/{total}"
 
 
 # ── dataset config ────────────────────────────────────────────────────────────
@@ -157,7 +163,8 @@ class PipelineRunner:
             print(f"  {tag} (nothing to do)")
             return
 
-        print(f"  {tag} {len(pending)} rows to process ▶")
+        total     = len(pending)
+        print(f"  {tag} {total} rows to process  {_progress_bar(0, total)}", flush=True)
 
         llm = OllamaLLM(
             model=ds.model,
@@ -172,22 +179,47 @@ class PipelineRunner:
         # Use a semaphore + individual ainvoke() calls so each result is
         # written to disk immediately as it completes.  This means a crash
         # mid-run loses at most one in-flight request, not the whole batch.
-        sem = asyncio.Semaphore(self.num_parallel)
+        sem       = asyncio.Semaphore(self.num_parallel)
         successes = 0
-        lock = asyncio.Lock()
-        t0 = time.time()
+        errors    = 0
+        done      = 0
+        in_flight = 0
+        lock      = asyncio.Lock()
+        t0        = time.time()
 
         async def _invoke_and_write(row_id: int, prompt: str, extra: dict) -> None:
-            nonlocal successes
+            nonlocal successes, errors, done, in_flight
             async with sem:
+                async with lock:
+                    in_flight += 1
                 try:
                     response = await llm.ainvoke(prompt)
                     status, text = "ok", response
                 except Exception as exc:
                     status, text = f"error: {exc}", None
+                finally:
+                    async with lock:
+                        in_flight -= 1
+
             async with lock:
                 if status == "ok":
                     successes += 1
+                else:
+                    errors += 1
+                done += 1
+                elapsed = time.time() - t0
+                rate    = done / elapsed if elapsed > 0 else 0.0
+                eta     = (total - done) / rate if rate > 0 else 0.0
+                bar     = _progress_bar(done, total)
+                # Overwrite the current line in-place for a live progress display
+                print(
+                    f"\r  {tag} {bar}"
+                    f"  in-flight={in_flight}/{self.num_parallel}"
+                    f"  ok={successes} err={errors}"
+                    f"  {rate:.1f} rows/s  ETA {eta:.0f}s  ",
+                    end="", flush=True,
+                )
+
                 _append_jsonl(out_path, {
                     "run":      run_num,
                     "dataset":  ds.name,
@@ -205,5 +237,8 @@ class PipelineRunner:
         ])
         elapsed = round(time.time() - t0, 2)
 
-        stats.record_batch(len(pending), successes)
-        print(f"  {tag} ✓ {successes}/{len(pending)} ok  ({elapsed}s)")
+        # Move to next line after the in-place progress bar
+        print(flush=True)
+        print(f"  {tag} ✓ done  {successes}/{total} ok  {errors} errors  ({elapsed}s)", flush=True)
+
+        stats.record_batch(total, successes)
