@@ -9,6 +9,7 @@ Entry point — settings come from config.yml, overridable with dot-notation:
 """
 
 import asyncio
+import logging
 import os
 from pathlib import Path
 
@@ -17,6 +18,10 @@ from omegaconf import DictConfig
 
 from .runner import PipelineRunner, DatasetConfig
 
+# Suppress httpx / httpcore / LangChain HTTP INFO chatter so only
+# the pipeline's own progress lines appear in the terminal.
+for _noisy in ("httpx", "httpcore", "langchain", "langchain_core", "ollama"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 @hydra.main(config_path=str(Path(__file__).parent), config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:
