@@ -1,0 +1,78 @@
+# TRL-model/config.yaml
+# All hyperparameters for TableEmbedJePA training.
+# Override any value on the command line, e.g.:
+#   python train.py training.epochs=30 model.num_layers=6
+
+# ── Hardware ──────────────────────────────────────────────────────────────
+# Set to 'high' or 'medium' to enable Tensor Core acceleration on NVIDIA GPUs.
+# 'highest' keeps full float32 precision (slowest). See torch.set_float32_matmul_precision.
+matmul_precision: high
+
+# ── Model architecture ─────────────────────────────────────────────────────
+model:
+  hidden_size: 384         # transformer working dimension (embed_dim_out)
+  num_layers: 8
+  num_heads: 12             # must divide hidden_size; auto-adjusted if needed
+  intermediate_size: null  # null = hidden_size * 4
+  attention_dropout: 0.1
+  hidden_dropout: 0.1
+  layer_norm_eps: 1.0e-12
+  temperature: 0.07          # InfoNCE softmax temperature
+  beta: 0.5                # reserved contrastive weighting scalar
+  ema_decay: 0.996         # EMA decay rate for target encoder update
+  ablate_proj: true       # true = replace input_projection with nn.Identity (requires hidden_size == embed_dim)
+
+# ── Loss weights ────────────────────────────────────────────────────────────
+# Each weight scales its loss term in the total loss.
+# Set to 0 to disable a loss entirely (it is still logged as a raw value).
+loss:
+  jepa: 1.0    # JEPA prediction loss  — predictor(h_node_a) ≈ target_enc(query)[CLS]
+  jepa_bar: 1.0  # JEPA bar loss      — predictor(h_node_b from SMP_bar) ≈ target_enc(query)[CLS]
+  local: 1.0   # local InfoNCE loss    — node_a ↔ {pivot_a, node_b, pivot_b}
+  global: 1.0  # global SMP InfoNCE   — CLS[SMP[i]] ↔ CLS[SMP_bar[i]] pairs
+
+# ── Data ───────────────────────────────────────────────────────────────────
+data:
+  path: "D:\\TABLE_DATASET\\WIKI_TABLE_SQL\\test_lookup_test_jepa_arch.jsonl"
+  max_records: null        # null = load all records
+
+# ── Embedder ────────────────────────────────────────────────────────────────
+# model_type: 'openai' | 'huggingface' | <any Ollama model name>
+embedder:
+  model_type: huggingface
+  base_url: http://134.184.22.126:10434/   # Ollama server (ignored for other backends)
+  model_name: sentence-transformers/all-MiniLM-L6-v2        # overrides HuggingFace Hub model name
+  api_key: null           # required for openai / huggingface backends
+  precompute: true        # batch-embed the whole dataset at init (recommended)
+  embed_batch_size: 64   # texts per embed_documents() call
+  embed_dim: 384         # null = auto-detect from embedder; set to override
+                          # (e.g. 768 for nomic-embed-text, 1536 for OpenAI)
+  cache_embeddings: false  # true = save/reload .embed_cache.pt alongside the dataset
+                            # (recommended for large datasets; one file per config combination)
+  embed_cache_dir: null    # null = store .embed_cache.pt next to the JSONL file
+                            # set an absolute path to redirect all cache files to a shared directory
+
+# ── SMP generation ──────────────────────────────────────────────────────────
+smp:
+  use_graph_walks: false  # true = SMP with graph (SemanticMetaPath walks, richer paths)
+                          # false = SMP without graph (row-major cell enumeration, faster)
+  num_walks: 50           # random walks per column header (graph mode only)
+  chunk_size: 1           # sub-graph chunk size for large tables (graph mode)
+
+# ── Training ───────────────────────────────────────────────────────────────
+training:
+  # mode: 'global'    — single model trained on all tables; saved to output_dir/
+  #        'per_table' — one model per table_id; saved to output_dir/<table_id>/
+  mode: global
+  output_dir: TRL-model/checkpoints
+  epochs: 20
+  batch_size: 16           # per-device; must be even (query-loss pairing)
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  max_grad_norm: 1.0
+  fp16: false              # set true when using a CUDA GPU
+  bf16: false
+  dataloader_num_workers: 4    # >0 is safe on Windows (spawn) when precompute=True; set 0 on Linux without precompute
+  logging_steps: 10
+  save_total_limit: 3      # keep only the N most-recent checkpoints
+  seed: 42

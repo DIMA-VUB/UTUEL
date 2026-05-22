@@ -7,3 +7,6 @@ __pycache__/
 datasets/*.jsonl
 results/
 datasets/**
+TRL-model/checkpoints/**
+TRL-model/lightning_logs/**
+TRL-model/outputs/**

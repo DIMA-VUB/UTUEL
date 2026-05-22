@@ -96,7 +96,7 @@ def is_correct(prediction: str | None, ground_truth) -> bool:
         return False
     pred_norm = normalize_answer(prediction)
     candidates = ground_truth if isinstance(ground_truth, list) else [ground_truth]
-    return any(pred_norm == normalize_answer(gt) for gt in candidates)
+    return all(pred_norm == normalize_answer(gt) for gt in candidates)
 
 
 # ── core compiler ─────────────────────────────────────────────────────────────
