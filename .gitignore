@@ -10,3 +10,6 @@ datasets/**
 TRL-model/checkpoints/**
 TRL-model/lightning_logs/**
 TRL-model/outputs/**
+TRL-model/multirun/**
+TRL-model/optuna.db
+

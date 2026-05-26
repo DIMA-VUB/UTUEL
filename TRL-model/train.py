@@ -513,7 +513,8 @@ def _train_one(
     dm: TableEmbedJePADataModule,
     out_dir: Path,
     run_label: str,
-) -> None:
+) -> float:
+    """Train one model and return the Optuna objective (MRR of the 'both' space)."""
     """Build model, run training, and save for one DataModule."""
     embed_dim_in = dm.embed_dim   # already truncated if truncate_embed_dim was set
     print(f"[train] embed_dim_in={embed_dim_in}  hidden_size={cfg.model.hidden_size}"
@@ -559,7 +560,10 @@ def _train_one(
         callbacks=[checkpoint_cb, lr_monitor],
         deterministic=False,
     )
-    trainer.fit(lightning_model, datamodule=dm)
+    ckpt_path = OmegaConf.select(cfg, "training.ckpt_path", default=None) or None
+    if ckpt_path:
+        print(f"[train] Resuming from checkpoint: {ckpt_path}")
+    trainer.fit(lightning_model, datamodule=dm, ckpt_path=ckpt_path)
 
     final_path = ckpt_dir / "final"
     final_path.mkdir(parents=True, exist_ok=True)
@@ -567,16 +571,27 @@ def _train_one(
     OmegaConf.save(cfg, str(final_path / "run_config.yaml"))
     print(f"[train] Saved → {final_path}")
     # ── Evaluate and save retrieval metrics ──────────────────────────────────
-    evaluate_model(
+    results = evaluate_model(
         model=lightning_model,
         dm=dm,
         cfg=cfg,
         out_path=ckpt_dir / "eval_results.json",
     )
+    # Return MRR ("both" space) as the Optuna objective; higher is better.
+    # Fallback to −train_loss when eval yields no evaluated records.
+    try:
+        mrr = float(results["metrics"]["both"]["MRR"])
+        if mrr > 0.0:
+            return mrr
+    except (KeyError, TypeError):
+        pass
+    _logged = trainer.callback_metrics
+    return -float(_logged.get("train_loss_epoch", float("inf")))
 
 # ── Main training function ────────────────────────────────────────────────────
 
-def train(cfg: DictConfig) -> None:
+def train(cfg: DictConfig) -> float:
+    """Run training and return the Optuna objective value (MRR or −loss)."""
     print("=" * 60)
     print("TableJEPA — Table Embedding JEPA (PyTorch Lightning)")
     print("=" * 60)
@@ -624,6 +639,7 @@ def train(cfg: DictConfig) -> None:
         table_ids = get_table_ids(data_path, max_records=cfg.data.max_records)
         print(f"[train] per_table mode — {len(table_ids)} tables found")
 
+        scores: list[float] = []
         for i, tid in enumerate(table_ids, 1):
             print(f"\n{'='*60}")
             print(f"[train] Table {i}/{len(table_ids)}: {tid}")
@@ -642,20 +658,22 @@ def train(cfg: DictConfig) -> None:
                       f"(< batch_size {cfg.training.batch_size})")
                 continue
 
-            _train_one(cfg, dm, out_dir=out_base / tid, run_label=tid)
+            score = _train_one(cfg, dm, out_dir=out_base / tid, run_label=tid)
+            scores.append(score)
+        return float(sum(scores) / max(len(scores), 1)) if scores else float("-inf")
 
     else:
         # ── Global mode: single model on all tables ───────────────────────────
         dm = TableEmbedJePADataModule(jsonl_path=data_path, **_dm_kwargs)
         dm.setup()
-        _train_one(cfg, dm, out_dir=out_base, run_label="table-jepa")
+        return _train_one(cfg, dm, out_dir=out_base, run_label="table-jepa")
 
 
 # ── Hydra entry point ─────────────────────────────────────────────────────────
 
 @hydra.main(config_path=".", config_name="config", version_base=None)
-def main(cfg: DictConfig) -> None:
-    train(cfg)
+def main(cfg: DictConfig) -> float:
+    return train(cfg)
 
 
 if __name__ == "__main__":
