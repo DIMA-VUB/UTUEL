@@ -240,7 +240,7 @@ class TableEmbedJePADataset(Dataset):
                     f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model}",
                     headers={"Authorization": f"Bearer {self._api_key}"},
                     json={"inputs": texts},
-                    timeout=120,
+                    timeout=120000,
                 )
                 resp.raise_for_status()
                 return resp.json()  # [[d], [d], ...]
@@ -260,7 +260,7 @@ class TableEmbedJePADataset(Dataset):
             resp = requests.post(
                 f"{self._base_url}/api/embed",
                 json={"model": model, "input": texts},
-                timeout=120,
+                timeout=120000,
             )
             resp.raise_for_status()
             return resp.json()["embeddings"]

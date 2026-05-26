@@ -12,4 +12,8 @@ TRL-model/lightning_logs/**
 TRL-model/outputs/**
 TRL-model/multirun/**
 TRL-model/optuna.db
-
+=*
+__pycache__/
+*.log
+*.ckpt
+*.db

@@ -41,7 +41,11 @@ sys.path.insert(0, str(_HERE.parent))
 from config  import TableEmbedJePAConfig                       # noqa: E402
 from model   import TableEmbedJePA                                  # noqa: E402
 from dataset import TableEmbedJePADataModule                   # noqa: E402
-
+import logging
+# Suppress httpx / httpcore / LangChain HTTP INFO chatter so only
+# the pipeline's own progress lines appear in the terminal.
+for _noisy in ("httpx", "httpcore", "langchain", "langchain_core", "ollama"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
 
 # ── Model factory ─────────────────────────────────────────────────────────────
 
