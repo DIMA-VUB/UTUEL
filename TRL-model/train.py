@@ -32,7 +32,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 
 # Allow `python TRL-model/train.py` from the repo root
 _HERE = Path(__file__).parent
@@ -548,6 +548,15 @@ def _train_one(
         save_last=True,
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
+    _es_patience  = int(OmegaConf.select(cfg, "training.early_stopping_patience", default=5))
+    _es_min_delta = float(OmegaConf.select(cfg, "training.early_stopping_min_delta", default=1e-4))
+    early_stop_cb = EarlyStopping(
+        monitor="train_loss_epoch",
+        patience=_es_patience,
+        min_delta=_es_min_delta,
+        mode="min",
+        verbose=False,
+    )
 
     if cfg.training.bf16:
         precision = "bf16-mixed"
@@ -561,13 +570,19 @@ def _train_one(
         precision=precision,
         gradient_clip_val=cfg.training.max_grad_norm,
         log_every_n_steps=cfg.training.logging_steps,
-        callbacks=[checkpoint_cb, lr_monitor],
+        callbacks=[checkpoint_cb, lr_monitor] + ([early_stop_cb] if _es_patience > 0 else []),
         deterministic=False,
     )
     ckpt_path = OmegaConf.select(cfg, "training.ckpt_path", default=None) or None
     if ckpt_path:
         print(f"[train] Resuming from checkpoint: {ckpt_path}")
     trainer.fit(lightning_model, datamodule=dm, ckpt_path=ckpt_path)
+
+    # Load the best checkpoint (lowest train_loss) before evaluation
+    if checkpoint_cb.best_model_path:
+        print(f"[train] Loading best checkpoint for evaluation: {checkpoint_cb.best_model_path}")
+        _best_ckpt = torch.load(checkpoint_cb.best_model_path, map_location="cpu", weights_only=False)
+        lightning_model.load_state_dict(_best_ckpt["state_dict"])
 
     final_path = ckpt_dir / "final"
     final_path.mkdir(parents=True, exist_ok=True)
@@ -636,6 +651,11 @@ def train(cfg: DictConfig) -> float:
         truncate_embed_dim=int(cfg.embedder.embed_dim) if cfg.embedder.embed_dim else None,
         cache_embeddings=bool(OmegaConf.select(cfg, "embedder.cache_embeddings", default=False)),
         embed_cache_dir=OmegaConf.select(cfg, "embedder.embed_cache_dir", default=None),
+        cat_qry_template=OmegaConf.select(cfg, "query.cat_qry_template",
+                                          default="what is {pivot_a} of {node_b}({pivot_b})?"),
+        cat_qry_bar_template=OmegaConf.select(cfg, "query.cat_qry_bar_template",
+                                              default="what is {pivot_b} of {node_a}({pivot_a})?"),
+
     )
 
     if mode == "per_table":

@@ -126,6 +126,8 @@ class TableEmbedJePADataset(Dataset):
         truncate_embed_dim: Optional[int] = None,
         cache_embeddings: bool = False,
         embed_cache_dir: Optional[Union[str, Path]] = None,
+        cat_qry_template: str = "what is {pivot_a} of {node_b}({pivot_b})?",
+        cat_qry_bar_template: str = "what is {pivot_b} of {node_a}({pivot_a})?",
     ) -> None:
         # ── Load records ──────────────────────────────────────────────────────
         self.records: list[dict] = []
@@ -164,6 +166,8 @@ class TableEmbedJePADataset(Dataset):
         self._chunk_size       = chunk_size
         self._cache_embeddings = cache_embeddings
         self._embed_cache_dir  = Path(embed_cache_dir) if embed_cache_dir else None
+        self._cat_qry_template     = cat_qry_template
+        self._cat_qry_bar_template = cat_qry_bar_template
 
         # ── Generate U-paths per record ───────────────────────────────────────
         _gen = (
@@ -235,7 +239,6 @@ class TableEmbedJePADataset(Dataset):
         if tag == "huggingface":
             model = self._model_name or "sentence-transformers/all-mpnet-base-v2"
             if self._api_key:
-                # HuggingFace Inference API — inputs[] each embedded independently
                 resp = requests.post(
                     f"https://api-inference.huggingface.co/pipeline/feature-extraction/{model}",
                     headers={"Authorization": f"Bearer {self._api_key}"},
@@ -245,7 +248,6 @@ class TableEmbedJePADataset(Dataset):
                 resp.raise_for_status()
                 return resp.json()  # [[d], [d], ...]
             else:
-                # Local sentence-transformers — each text encoded independently
                 from sentence_transformers import SentenceTransformer
                 if not hasattr(self, "_st_model"):
                     self._st_model = SentenceTransformer(model)
@@ -255,7 +257,6 @@ class TableEmbedJePADataset(Dataset):
                 return vecs.tolist()
 
         if tag != "openai":
-            # Ollama native batch embed — each element processed independently
             model = self._model_name or tag
             resp = requests.post(
                 f"{self._base_url}/api/embed",
@@ -265,7 +266,6 @@ class TableEmbedJePADataset(Dataset):
             resp.raise_for_status()
             return resp.json()["embeddings"]
 
-        # OpenAI: LangChain handles independent per-text encoding
         return self._embedder.embed_documents(texts)
 
     def _batch_embed(self, texts: list, batch_size: int) -> torch.Tensor:
@@ -341,22 +341,19 @@ class TableEmbedJePADataset(Dataset):
                          upath.cell_value_b, upath.col_header_b):
                 if text not in text_to_idx:
                     text_to_idx[text] = len(text_to_idx)
-            # Concatenated query string (SMP):     pivot_a + node_b + pivot_b
-            cat_qry = f"{upath.col_header_a} ... {upath.cell_value_b}({upath.col_header_b})?"
-            if cat_qry not in text_to_idx:
-                text_to_idx[cat_qry] = len(text_to_idx)
-            # Concatenated query string (SMP_bar): pivot_b + node_a + pivot_a
-            cat_qry_bar = f"{upath.col_header_b} ... {upath.cell_value_a}({upath.col_header_a})?"
-            if cat_qry_bar not in text_to_idx:
-                text_to_idx[cat_qry_bar] = len(text_to_idx)
+            _fmt = dict(pivot_a=upath.col_header_a, node_a=upath.cell_value_a,
+                        node_b=upath.cell_value_b,  pivot_b=upath.col_header_b)
+            for text in (self._cat_qry_template.format(**_fmt),
+                         self._cat_qry_bar_template.format(**_fmt)):
+                if text not in text_to_idx:
+                    text_to_idx[text] = len(text_to_idx)
 
-        node_texts = [""] * len(text_to_idx)
+        all_texts = [""] * len(text_to_idx)
         for text, idx in text_to_idx.items():
-            node_texts[idx] = text
+            all_texts[idx] = text
 
-        print(f"[dataset][embed_nodes] {len(node_texts)} unique node/query texts "
-              f"(batch_size={batch_size})...")
-        self._embed_cache = self._batch_embed(node_texts, batch_size)
+        print(f"[dataset][embed] {len(all_texts)} unique texts (batch_size={batch_size})...")
+        self._embed_cache = self._batch_embed(all_texts, batch_size)
         self._text_to_idx = text_to_idx
 
         questions = [rec.get("question", "") for rec in self.records]
@@ -379,8 +376,10 @@ class TableEmbedJePADataset(Dataset):
             nb = text_to_idx[upath.cell_value_b]
             pb = text_to_idx[upath.col_header_b]
             smp_rows.append([pa, na, nb, pb])
-            cat_qry     = f"{upath.col_header_a} ... {upath.cell_value_b}({upath.col_header_b})?"
-            cat_qry_bar = f"{upath.col_header_b} ... {upath.cell_value_a}({upath.col_header_a})?"
+            _fmt = dict(pivot_a=upath.col_header_a, node_a=upath.cell_value_a,
+                        node_b=upath.cell_value_b,  pivot_b=upath.col_header_b)
+            cat_qry     = self._cat_qry_template.format(**_fmt)
+            cat_qry_bar = self._cat_qry_bar_template.format(**_fmt)
             qry_cat_rows.append(text_to_idx[cat_qry])
             qry_bar_cat_rows.append(text_to_idx[cat_qry_bar])
             rec_list.append(r_idx)
@@ -409,9 +408,9 @@ class TableEmbedJePADataset(Dataset):
         return self._embed_cache[self._text_to_idx[text]]
 
     def _embed_live(self, text: str) -> torch.Tensor:
-        vec = self._embedder.embed_query(text)
-        self._embed_dim = len(vec)
-        return torch.tensor(vec, dtype=torch.float32)
+        vecs = self._embed_batch_chunk([text])
+        self._embed_dim = len(vecs[0])
+        return torch.tensor(vecs[0], dtype=torch.float32)
 
     # ── Dataset protocol ──────────────────────────────────────────────────────
 
@@ -434,10 +433,12 @@ class TableEmbedJePADataset(Dataset):
             nb = self._embed_live(upath.cell_value_b)
             pb = self._embed_live(upath.col_header_b)
             smp_embeds   = torch.stack([pa, na, nb, pb])  # [4, d]
-            cat_qry_text     = f"{upath.col_header_a} {upath.cell_value_b} {upath.col_header_b}"
-            cat_qry_bar_text = f"{upath.col_header_b} {upath.cell_value_a} {upath.col_header_a}"
-            query_embeds     = self._embed_live(cat_qry_text).unsqueeze(0)     # [1, d]
-            query_bar_embeds = self._embed_live(cat_qry_bar_text).unsqueeze(0) # [1, d]
+            _fmt = dict(pivot_a=upath.col_header_a, node_a=upath.cell_value_a,
+                        node_b=upath.cell_value_b,  pivot_b=upath.col_header_b)
+            cat_qry_text     = self._cat_qry_template.format(**_fmt)
+            cat_qry_bar_text = self._cat_qry_bar_template.format(**_fmt)
+            query_embeds     = self._embed_live(cat_qry_text).unsqueeze(0)      # [1, d]
+            query_bar_embeds = self._embed_live(cat_qry_bar_text).unsqueeze(0)  # [1, d]
             question_emb     = self._embed_live(self.records[rec_idx].get("question", ""))
 
         return {
@@ -455,8 +456,8 @@ class TableEmbedJePADataset(Dataset):
         return self._all_upaths[record_idx]
 
     def embed_question(self, question: str) -> torch.Tensor:
-        vec = self._embedder.embed_query(question)
-        return torch.tensor(vec, dtype=torch.float32)
+        vecs = self._embed_batch_chunk([question])
+        return torch.tensor(vecs[0], dtype=torch.float32)
 
 
 # ── Collation ─────────────────────────────────────────────────────────────────
@@ -528,6 +529,8 @@ class TableEmbedJePADataModule(pl.LightningDataModule):
         truncate_embed_dim: Optional[int] = None,
         cache_embeddings: bool = False,
         embed_cache_dir: Optional[Union[str, Path]] = None,
+        cat_qry_template: str = "what is {pivot_a} of {node_b}({pivot_b})?",
+        cat_qry_bar_template: str = "what is {pivot_b} of {node_a}({pivot_a})?",
     ):
         super().__init__()
         self.jsonl_path  = jsonl_path
@@ -548,6 +551,8 @@ class TableEmbedJePADataModule(pl.LightningDataModule):
             truncate_embed_dim=truncate_embed_dim,
             cache_embeddings=cache_embeddings,
             embed_cache_dir=embed_cache_dir,
+            cat_qry_template=cat_qry_template,
+            cat_qry_bar_template=cat_qry_bar_template,
         )
         self._dataset: Optional[TableEmbedJePADataset] = None
 

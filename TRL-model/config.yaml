@@ -11,11 +11,11 @@ matmul_precision: high
 # ── Model architecture ─────────────────────────────────────────────────────
 model:
   hidden_size: 384         # transformer working dimension (embed_dim_out)
-  num_layers: 8
+  num_layers: 16
   num_heads: 12             # must divide hidden_size; auto-adjusted if needed
   intermediate_size: null  # null = hidden_size * 4
-  attention_dropout: 0.1
-  hidden_dropout: 0.1
+  attention_dropout: 0.01
+  hidden_dropout: 0.01
   layer_norm_eps: 1.0e-12
   temperature: 0.07          # InfoNCE softmax temperature
   beta: 0.5                # reserved contrastive weighting scalar
@@ -52,6 +52,15 @@ embedder:
   embed_cache_dir: null    # null = store .embed_cache.pt next to the JSONL file
                             # set an absolute path to redirect all cache files to a shared directory
 
+# ── Query templates ───────────────────────────────────────────────────────────
+# Templates for the concatenated query strings fed to the embedder.
+# Available placeholders (all U-path fields):
+#   {pivot_a} = col_header_a   {node_a} = cell_value_a
+#   {pivot_b} = col_header_b   {node_b} = cell_value_b
+query:
+  cat_qry_template:     "{pivot_b} ... {pivot_a}({node_a})?"
+  cat_qry_bar_template: "{pivot_a} ... {pivot_b}({node_b})?"
+
 # ── SMP generation ──────────────────────────────────────────────────────────
 smp:
   use_graph_walks: false  # true = SMP with graph (SemanticMetaPath walks, richer paths)
@@ -65,8 +74,8 @@ training:
   #        'per_table' — one model per table_id; saved to output_dir/<table_id>/
   mode: global
   output_dir: TRL-model/checkpoints
-  epochs: 20
-  batch_size: 16           # per-device; must be even (query-loss pairing)
+  epochs: 50
+  batch_size: 256           # per-device; must be even (query-loss pairing)
   lr: 1.0e-4
   weight_decay: 1.0e-2
   max_grad_norm: 1.0
@@ -76,4 +85,6 @@ training:
   logging_steps: 10
   save_total_limit: 3      # keep only the N most-recent checkpoints
   seed: 42
-  ckpt_path: null          # path to a .ckpt file to resume from (e.g. TRL-model/checkpoints/all-MiniLM-L6-v2/last.ckpt)
+  ckpt_path: null  # path to a .ckpt file to resume from (e.g. TRL-model/checkpoints/all-MiniLM-L6-v2/last.ckpt)
+  early_stopping_patience: 0     # epochs without train_loss improvement before stopping; 0 = disabled
+  early_stopping_min_delta: 1e-4 # minimum decrease in train_loss that counts as improvement         
