@@ -10,12 +10,12 @@ matmul_precision: high
 
 # ── Model architecture ─────────────────────────────────────────────────────
 model:
-  hidden_size: 384         # transformer working dimension (embed_dim_out)
+  hidden_size: 512         # transformer working dimension (embed_dim_out)
   num_layers: 16
-  num_heads: 12             # must divide hidden_size; auto-adjusted if needed
+  num_heads: 4             # must divide hidden_size; auto-adjusted if needed
   intermediate_size: null  # null = hidden_size * 4
-  attention_dropout: 0.01
-  hidden_dropout: 0.01
+  attention_dropout: 0.1
+  hidden_dropout: 0.1
   layer_norm_eps: 1.0e-12
   temperature: 0.07          # InfoNCE softmax temperature
   beta: 0.5                # reserved contrastive weighting scalar
@@ -35,21 +35,22 @@ loss:
 data:
   path: "D:\\TABLE_DATASET\\WIKI_TABLE_SQL\\test_lookup_test_jepa_arch.jsonl"
   max_records: null        # null = load all records
+  unique_tables_only: true  # true = keep only the first record per table_id (no duplicate tables in training)
 
 # ── Embedder ────────────────────────────────────────────────────────────────
 # model_type: 'openai' | 'huggingface' | <any Ollama model name>
 embedder:
-  model_type: huggingface
+  model_type: ollama
   base_url: http://134.184.22.126:10434/   # Ollama server (ignored for other backends)
-  model_name: sentence-transformers/all-MiniLM-L6-v2        # overrides HuggingFace Hub model name
+  model_name: qwen3-embedding:0.6b #sentence-transformers/all-MiniLM-L6-v2        # overrides HuggingFace Hub model name
   api_key: null           # required for openai / huggingface backends
   precompute: true        # batch-embed the whole dataset at init (recommended)
   embed_batch_size: 64   # texts per embed_documents() call
-  embed_dim: 384         # null = auto-detect from embedder; set to override
+  embed_dim: 768         # null = auto-detect from embedder; set to override
                           # (e.g. 768 for nomic-embed-text, 1536 for OpenAI)
-  cache_embeddings: false  # true = save/reload .embed_cache.pt alongside the dataset
+  cache_embeddings: true  # true = save/reload .embed_cache.pt alongside the dataset
                             # (recommended for large datasets; one file per config combination)
-  embed_cache_dir: null    # null = store .embed_cache.pt next to the JSONL file
+  embed_cache_dir: .cache    # null = store .embed_cache.pt next to the JSONL file
                             # set an absolute path to redirect all cache files to a shared directory
 
 # ── Query templates ───────────────────────────────────────────────────────────
@@ -75,10 +76,10 @@ training:
   mode: global
   output_dir: TRL-model/checkpoints
   epochs: 50
-  batch_size: 256           # per-device; must be even (query-loss pairing)
+  batch_size: 128           # per-device; must be even (query-loss pairing)
   lr: 1.0e-4
   weight_decay: 1.0e-2
-  max_grad_norm: 1.0
+  max_grad_norm: 2.0
   fp16: false              # set true when using a CUDA GPU
   bf16: false
   dataloader_num_workers: 4    # >0 is safe on Windows (spawn) when precompute=True; set 0 on Linux without precompute

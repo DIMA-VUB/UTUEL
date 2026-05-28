@@ -313,6 +313,16 @@ class Predictor(nn.Module):
         return self.net(x)
 
 
+
+class NonSquareIdentity(nn.Module):
+    def __init__(self, in_features, out_features):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+
+    def forward(self, x):
+        return x[..., :self.out_features]
+
 # ── TableEmbedJePA ───────────────────────────────────────────────────────────
 
 class TableEmbedJePA(pl.LightningModule):
@@ -380,13 +390,14 @@ class TableEmbedJePA(pl.LightningModule):
         # When ablate_proj=True, replaced with Identity; the transformer then
         # operates at embedding_dim so we patch config.hidden_size accordingly.
         if ablate_proj:
-            self.input_projection = nn.Identity()
+            # self.input_projection = nn.Identity()
+            self.input_projection = NonSquareIdentity(config.embedding_dim, config.hidden_size)
             config = copy.copy(config)           # don't mutate the caller's object
-            config.hidden_size = config.embedding_dim
+            # config.hidden_size = config.embedding_dim
         else:
             self.input_projection = nn.Linear(config.embedding_dim, config.hidden_size)
 
-        # CLS token: same dimension as projection output
+        # CLS token: same dimension as projection input
         self.cls_token = nn.Parameter(torch.zeros(1, 1, config.embedding_dim))
         nn.init.trunc_normal_(self.cls_token, std=0.02)
 
@@ -469,8 +480,9 @@ class TableEmbedJePA(pl.LightningModule):
         bar_proj = self.input_projection(smp_bar_embeds)              # [B, 4, d_out]
         qry_proj = self.input_projection(query_embeds)                # [B, 1, d_out]
         qry_bar_proj = self.input_projection(query_bar_embeds)        # [B, 1, d_out]
+        cls_proj = self.input_projection(self.cls_token)                      # [1, 1, d_out]
 
-        cls = self.cls_token.expand(B, -1, -1)                       # [B, 1, d_out]
+        cls = cls_proj.expand(B, -1, -1)                       # [B, 1, d_out]
 
         # Prepend CLS to SMP sequences (query is a single concatenated LLM embedding)
         # SMP positions:   0=CLS, 1=pivot_a, 2=node_a, 3=node_b, 4=pivot_b

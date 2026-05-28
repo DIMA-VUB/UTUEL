@@ -267,13 +267,14 @@ def evaluate_model(
 
         with torch.no_grad():
             proj = model.input_projection(smp_raw)
-            cls  = model.cls_token.expand(n_up, -1, -1)
+            cls_proj = model.input_projection(model.cls_token)
+            cls  = cls_proj.expand(n_up, -1, -1)           # [n, 1, hidden_size]
             enc, _, _ = model.transformer_encoder(torch.cat([cls, proj], dim=1))
             na = F.normalize(enc[:, 2, :], dim=-1).cpu()          # [n, d]
 
             smp_bar = smp_raw[:, [3, 2, 1, 0], :]
             proj_b  = model.input_projection(smp_bar)
-            cls_b   = model.cls_token.expand(n_up, -1, -1)
+            cls_b   = cls_proj.expand(n_up, -1, -1)
             enc_b, _, _ = model.transformer_encoder(torch.cat([cls_b, proj_b], dim=1))
             nb = F.normalize(enc_b[:, 2, :], dim=-1).cpu()        # [n, d]
 
@@ -529,8 +530,13 @@ def _train_one(
     print(f"[train] trainable params: {n_params:,}")
 
     # Subfolder = last component of the embedder model name (sanitized)
-    _model_slug = cfg.embedder.model_name.split("/")[-1].replace(" ", "_")
-    ckpt_dir = out_dir / _model_slug
+    _model_slug = cfg.embedder.model_name.split("/")[-1].replace(" ", "_").replace(":", "#")
+
+    # Append a timestamp suffix so each run writes to its own directory and
+    # never overwrites a previous run (e.g. checkpoints/2026-05-28_14-03-22/).
+    _run_ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+
+    ckpt_dir = out_dir / _model_slug /_run_ts
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # Save the full resolved config alongside the checkpoints immediately,
@@ -590,6 +596,8 @@ def _train_one(
     OmegaConf.save(cfg, str(final_path / "run_config.yaml"))
     print(f"[train] Saved → {final_path}")
     # ── Evaluate and save retrieval metrics ──────────────────────────────────
+    # dm._dataset always contains ALL records (unique_tables_only only restricts
+    # the training DataLoader via SubsetRandomSampler, not the stored data).
     results = evaluate_model(
         model=lightning_model,
         dm=dm,
@@ -632,6 +640,7 @@ def train(cfg: DictConfig) -> float:
     if not out_base.is_absolute():
         out_base = (_HERE.parent / out_base).resolve()
 
+
     mode = cfg.training.get("mode", "global")
 
     # ── Common DataModule kwargs ──────────────────────────────────────────────
@@ -643,6 +652,7 @@ def train(cfg: DictConfig) -> float:
         model_name=cfg.embedder.model_name,
         api_key=cfg.embedder.api_key,
         max_records=cfg.data.max_records,
+        unique_tables_only=bool(OmegaConf.select(cfg, "data.unique_tables_only", default=False)),
         precompute=cfg.embedder.precompute,
         embed_batch_size=cfg.embedder.embed_batch_size,
         use_graph_walks=cfg.smp.use_graph_walks,

@@ -43,7 +43,7 @@ from typing import Optional, Union
 
 import pytorch_lightning as pl
 import torch
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, SubsetRandomSampler
 
 try:
     from .smp import UPath, generate_u_paths_flat, generate_u_paths_from_graph
@@ -130,6 +130,8 @@ class TableEmbedJePADataset(Dataset):
         cat_qry_bar_template: str = "what is {pivot_b} of {node_a}({pivot_a})?",
     ) -> None:
         # ── Load records ──────────────────────────────────────────────────────
+        # Always loads ALL records; unique_tables_only is a DataModule concern
+        # that uses SubsetRandomSampler to limit *training*, not data loading.
         self.records: list[dict] = []
         path = Path(jsonl_path)
         with path.open(encoding="utf-8") as f:
@@ -195,6 +197,24 @@ class TableEmbedJePADataset(Dataset):
         ]
         print(f"[dataset][smp_gen] {len(self._samples)} U-path samples "
               f"from {len(self.records)} records")
+
+        # ── Index of training samples for unique-table mode ───────────────────
+        # Contains ALL flat sample indices (into _samples) whose record is the
+        # *first* record encountered for that table_id.  The DataModule uses
+        # SubsetRandomSampler on this list when unique_tables_only=True so the
+        # full dataset is precomputed once and evaluation always has all records.
+        _first_rec_per_table: dict[str, int] = {}
+        for _r, _rec in enumerate(self.records):
+            _tid = str(_rec.get("table_id", _r))
+            if _tid not in _first_rec_per_table:
+                _first_rec_per_table[_tid] = _r
+        _unique_idxs: list[int] = [
+            _j for _j, (_r, _) in enumerate(self._samples)
+            if _first_rec_per_table.get(str(self.records[_r].get("table_id", _r))) == _r
+        ]
+        self._unique_table_train_idxs: list[int] = _unique_idxs
+        print(f"[dataset][unique_tables] {len(_first_rec_per_table)} unique tables → "
+              f"{len(_unique_idxs)} training samples (of {len(self._samples)} total)")
 
         # ── Precompute embeddings ─────────────────────────────────────────────
         self._embed_cache: Optional[torch.Tensor] = None
@@ -306,8 +326,8 @@ class TableEmbedJePADataset(Dataset):
         _key_str  = "|".join([
             str(self._jsonl_path.resolve()),
             self._model_name or self._model_type,
-            str(self._max_records),
-            str(self._filter_table_id),
+            # str(self._max_records),
+            # str(self._filter_table_id),
             str(self._use_graph_walks),
             str(self._chunk_size),
             str(self._truncate_embed_dim),
@@ -413,6 +433,22 @@ class TableEmbedJePADataset(Dataset):
         return torch.tensor(vecs[0], dtype=torch.float32)
 
     # ── Dataset protocol ──────────────────────────────────────────────────────
+
+    # Windows multiprocessing (spawn) pickles the dataset for each DataLoader
+    # worker.  SentenceTransformer holds _thread.RLock objects that cannot be
+    # pickled.  Workers only need the precomputed tensors (_embed_cache, etc.),
+    # so we simply drop _st_model and _embedder from the pickled state.
+    # The main process retains them for evaluation / on-demand embedding calls.
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        state.pop("_st_model", None)   # SentenceTransformer — has thread locks
+        state.pop("_embedder", None)   # LangChain embedder  — may also have locks
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        # Workers operate purely via the fast tensor path (__getitem__ precomputed).
+        # _st_model / _embedder are not restored; the main process keeps its own copy.
 
     def __len__(self) -> int:
         return len(self._samples)
@@ -521,6 +557,7 @@ class TableEmbedJePADataModule(pl.LightningDataModule):
         api_key: Optional[str] = None,
         max_records: Optional[int] = None,
         filter_table_id: Optional[str] = None,
+        unique_tables_only: bool = False,
         precompute: bool = True,
         embed_batch_size: int = 256,
         use_graph_walks: bool = False,
@@ -536,6 +573,7 @@ class TableEmbedJePADataModule(pl.LightningDataModule):
         self.jsonl_path  = jsonl_path
         self.batch_size  = batch_size
         self.num_workers = num_workers
+        self._unique_tables_only = unique_tables_only
         self._ds_kwargs  = dict(
             model_type=model_type,
             base_url=base_url,
@@ -568,10 +606,8 @@ class TableEmbedJePADataModule(pl.LightningDataModule):
         return self._dataset.embed_dim
 
     def train_dataloader(self) -> DataLoader:
-        return DataLoader(
-            self._dataset,
+        _common = dict(
             batch_size=self.batch_size,
-            shuffle=True,
             drop_last=True,
             num_workers=self.num_workers,
             persistent_workers=self.num_workers > 0,
@@ -579,3 +615,17 @@ class TableEmbedJePADataModule(pl.LightningDataModule):
             pin_memory=True,
             collate_fn=jepa_collate_fn,
         )
+        if self._unique_tables_only:
+            # Restrict training to U-paths from the first record of each table.
+            # The full dataset (all records) remains available for evaluation.
+            _idxs = self._dataset._unique_table_train_idxs
+            print(f"[datamodule] unique_tables_only — training on "
+                  f"{len(_idxs):,} samples from "
+                  f"{len(set(str(self._dataset.records[r].get('table_id', r)) for r, _ in (self._dataset._samples[i] for i in _idxs))):,} tables "
+                  f"(full dataset: {len(self._dataset):,} samples)")
+            return DataLoader(
+                self._dataset,
+                sampler=SubsetRandomSampler(_idxs),
+                **_common,
+            )
+        return DataLoader(self._dataset, shuffle=True, **_common)
