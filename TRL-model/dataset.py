@@ -35,7 +35,6 @@ Embedder backends
 
 from __future__ import annotations
 
-import hashlib
 import json
 import requests
 from pathlib import Path
@@ -317,31 +316,35 @@ class TableEmbedJePADataset(Dataset):
 
         Cache behaviour
         ───────────────
-        When cache_embeddings=True a .embed_cache.pt file is written next to the
-        JSONL.  The cache key covers: path, model, max_records, filter_table_id,
-        use_graph_walks, chunk_size, truncate_embed_dim — so each distinct
-        configuration gets its own file and stale caches are never silently reused.
+        When cache_embeddings=True a .embed_cache.pt file is saved with the
+        *full* embedding dim (e.g. _dim_768.embed_cache.pt).  On future runs the
+        code searches for any cache file for the same dataset+model whose stored
+        dim is >= the requested truncate_embed_dim, loads it, and trims in-memory.
+        This means a single full-dim cache can serve all smaller truncation targets.
         """
-        # ── Cache file path ─────────────────────────────────────────────────────
-        _key_str  = "|".join([
-            str(self._jsonl_path.resolve()),
-            self._model_name or self._model_type,
-            # str(self._max_records),
-            # str(self._filter_table_id),
-            str(self._use_graph_walks),
-            str(self._chunk_size),
-            str(self._truncate_embed_dim),
-        ])
-        _key_hash   = hashlib.md5(_key_str.encode()).hexdigest()[:10]
-        _model_slug = (self._model_name or self._model_type).replace("/", "-").replace("\\", "-")
-        _cache_dir  = self._embed_cache_dir if self._embed_cache_dir else self._jsonl_path.parent
+        _model_slug  = (self._model_name or self._model_type).replace("/", "-").replace("\\", "-")
+        _cache_dir   = self._embed_cache_dir if self._embed_cache_dir else self._jsonl_path.parent
         _cache_dir.mkdir(parents=True, exist_ok=True)
-        _cache_file = _cache_dir / f"{self._jsonl_path.stem}_{_model_slug}_{_key_hash}.embed_cache.pt"
+        _stem        = self._jsonl_path.stem
+        _prefix      = f"{_stem}_{_model_slug}_dim_"          # e.g. myset_nomic-embed-text_dim_
+        _target_dim  = self._truncate_embed_dim               # None = keep full dim
+
+        # ── Find the smallest existing cache whose dim >= target_dim ────────────
+        _best_file: Optional[Path] = None
+        _best_dim:  Optional[int]  = None
+        for _f in sorted(_cache_dir.glob(f"{_prefix}*.embed_cache.pt")):
+            try:
+                _dim_val = int(_f.name[len(_prefix):].split(".embed_cache.pt")[0])
+            except ValueError:
+                continue
+            if _target_dim is None or _dim_val >= _target_dim:
+                if _best_dim is None or _dim_val < _best_dim:   # prefer smallest sufficient
+                    _best_dim, _best_file = _dim_val, _f
 
         # ── Try loading from disk ───────────────────────────────────────────────
-        if _cache_file.exists():
-            print(f"[dataset][cache] loading precomputed embeddings from {_cache_file.name}")
-            _ckpt = torch.load(_cache_file, map_location="cpu", weights_only=False)
+        if _best_file is not None:
+            print(f"[dataset][cache] loading from {_best_file.name}  (stored dim={_best_dim})")
+            _ckpt = torch.load(_best_file, map_location="cpu", weights_only=False)
             self._embed_cache     = _ckpt["embed_cache"]
             self._question_cache  = _ckpt["question_cache"]
             self._text_to_idx     = _ckpt["text_to_idx"]
@@ -350,6 +353,11 @@ class TableEmbedJePADataset(Dataset):
             self._qry_bar_cat_idx = _ckpt["qry_bar_cat_idx"]
             self._rec_idx         = _ckpt["rec_idx"]
             self._embed_dim       = _ckpt["embed_dim"]
+            if _target_dim is not None and self._embed_dim > _target_dim:
+                self._embed_cache    = self._embed_cache[:, :_target_dim].contiguous()
+                self._question_cache = self._question_cache[:, :_target_dim].contiguous()
+                self._embed_dim      = _target_dim
+                print(f"[dataset][cache] trimmed in-memory to first {_target_dim} dims")
             print(f"[dataset][cache] loaded  embed_cache={tuple(self._embed_cache.shape)}  "
                   f"embed_dim={self._embed_dim}")
             return
@@ -380,14 +388,6 @@ class TableEmbedJePADataset(Dataset):
         print(f"[dataset][embed_questions] {len(questions)} question embeddings...")
         self._question_cache = self._batch_embed(questions, batch_size)
 
-        # Truncate caches to the first N dimensions if requested
-        if self._truncate_embed_dim is not None:
-            d = self._truncate_embed_dim
-            self._embed_cache     = self._embed_cache[:, :d].contiguous()
-            self._question_cache  = self._question_cache[:, :d].contiguous()
-            self._embed_dim       = d
-            print(f"[dataset][truncate] embed_cache and question_cache truncated to first {d} dims")
-
         # Build index tensors once — avoids per-sample dict lookups at train time
         smp_rows, qry_cat_rows, qry_bar_cat_rows, rec_list = [], [], [], []
         for r_idx, upath in self._samples:
@@ -407,11 +407,15 @@ class TableEmbedJePADataset(Dataset):
         self._qry_cat_idx     = torch.tensor(qry_cat_rows,     dtype=torch.long)  # [N]
         self._qry_bar_cat_idx = torch.tensor(qry_bar_cat_rows, dtype=torch.long)  # [N]
         self._rec_idx         = torch.tensor(rec_list,         dtype=torch.long)  # [N]
-        print(f"[dataset][build_index] done  embed_dim={self._embed_dim}")
 
-        # ── Save to disk cache ──────────────────────────────────────────────────
+        # ── Save full-dim cache — must happen before in-memory truncation ────────
+        # File is named with the *actual* embed dim so any smaller truncate_embed_dim
+        # can reuse it on future runs without re-computing.
+        _actual_dim  = int(self._embed_cache.shape[1])
+        _cache_file  = _cache_dir / f"{_prefix}{_actual_dim}.embed_cache.pt"
+        print(f"[dataset][build_index] done  embed_dim={_actual_dim}")
         if self._cache_embeddings:
-            print(f"[dataset][cache] saving to {_cache_file.name} …")
+            print(f"[dataset][cache] saving full-dim ({_actual_dim}) cache to {_cache_file.name} …")
             torch.save({
                 "embed_cache":     self._embed_cache,
                 "question_cache":  self._question_cache,
@@ -420,9 +424,16 @@ class TableEmbedJePADataset(Dataset):
                 "qry_cat_idx":     self._qry_cat_idx,
                 "qry_bar_cat_idx": self._qry_bar_cat_idx,
                 "rec_idx":         self._rec_idx,
-                "embed_dim":       self._embed_dim,
+                "embed_dim":       _actual_dim,
             }, _cache_file)
             print(f"[dataset][cache] saved   ({_cache_file.stat().st_size / 1024**2:.1f} MB)")
+
+        # Truncate in-memory after saving (saved file keeps full dim for reuse)
+        if _target_dim is not None:
+            self._embed_cache    = self._embed_cache[:, :_target_dim].contiguous()
+            self._question_cache = self._question_cache[:, :_target_dim].contiguous()
+            self._embed_dim      = _target_dim
+            print(f"[dataset][truncate] in-memory truncated to first {_target_dim} dims")
 
     def _get_node_embed(self, text: str) -> torch.Tensor:
         return self._embed_cache[self._text_to_idx[text]]
