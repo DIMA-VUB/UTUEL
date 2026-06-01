@@ -20,6 +20,7 @@ Loss weights are configured in the `loss:` section of config.yaml.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sys
 from collections import Counter, defaultdict
@@ -456,9 +457,14 @@ def evaluate_model(
     metrics                 = {sp: _agg(accs[sp]) for sp in _SPACES}
     table_retrieval_metrics = _agg_tbl(tbl_hits)
 
+    _cfg_yaml     = OmegaConf.to_yaml(cfg)
+    _eval_cfg_hash = hashlib.md5(_cfg_yaml.encode()).hexdigest()[:8]
+    _eval_ts      = datetime.datetime.now().isoformat(timespec="seconds")
+
     results = {
         "metadata": {
-            "timestamp":     datetime.datetime.now().isoformat(timespec="seconds"),
+            "timestamp":     _eval_ts,
+            "cfg_hash":      _eval_cfg_hash,
             "model_class":   type(model).__name__,
             "hidden_size":   int(cfg.model.hidden_size),
             "num_layers":    int(cfg.model.num_layers),
@@ -477,6 +483,7 @@ def evaluate_model(
                 "local":    float(cfg.loss.local),
                 "global":   float(cfg.loss["global"]),
             },
+            # "cfg":           OmegaConf.to_container(cfg, resolve=True),
         },
         "metrics":          metrics,
         "table_retrieval":  table_retrieval_metrics,
@@ -535,8 +542,9 @@ def _train_one(
     # Append a timestamp suffix so each run writes to its own directory and
     # never overwrites a previous run (e.g. checkpoints/2026-05-28_14-03-22/).
     _run_ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    _cfg_hash = hashlib.md5(OmegaConf.to_yaml(cfg).encode()).hexdigest()[:8]
 
-    ckpt_dir = out_dir / _model_slug /_run_ts
+    ckpt_dir = out_dir / _model_slug / f"{_run_ts}_{_cfg_hash}"
     ckpt_dir.mkdir(parents=True, exist_ok=True)
 
     # Save the full resolved config alongside the checkpoints immediately,

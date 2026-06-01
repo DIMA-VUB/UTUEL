@@ -342,6 +342,7 @@ class TableEmbedJePADataset(Dataset):
                     _best_dim, _best_file = _dim_val, _f
 
         # ── Try loading from disk ───────────────────────────────────────────────
+        print(f"[dataset][cache] looking for cache files with prefix {_prefix} …")
         if _best_file is not None:
             print(f"[dataset][cache] loading from {_best_file.name}  (stored dim={_best_dim})")
             _ckpt = torch.load(_best_file, map_location="cpu", weights_only=False)
