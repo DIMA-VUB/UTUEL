@@ -1,0 +1,132 @@
+# ── Table Retrieval Evaluation Config ────────────────────────────────────────
+# Each entry under `datasets` defines one evaluation run:
+#   - the dataset to evaluate
+#   - the embedding model to use (huggingface | ollama | custom)
+#
+# Run:  python table_retrieval/evaluate.py
+#       python table_retrieval/evaluate.py --config table_retrieval/config.yaml
+#
+# Results are written to `output_dir`; a compiled report is produced by
+#       python table_retrieval/report.py
+
+# ── Shared retrieval settings ─────────────────────────────────────────────────
+retrieval:
+  k_values:      [1, 3, 5, 10, 20]   # cut-offs for Hit@k
+  top_k_export:  5                    # top-k table_ids saved per query for inspection
+  tsr_top_k:     2000                 # nodes scanned per query in TSR (top-k cosine)
+  tsr_mrr_depth: 1000                 # unique tables ranked for MRR in TSR evaluation
+
+# ── Output / Input base directories ─────────────────────────────────────────
+output_dir:       table_retrieval/results
+checkpoints_dir:  D:\UTUEL_OUTPUT\collect_results_revision\checkpoints
+cache_dir:        D:\UTUEL_OUTPUT\cache_embeddings
+
+# ── Dataset / model entries ───────────────────────────────────────────────────
+# Supported embedder types:
+#   huggingface  — sentence-transformers loaded locally (no API call)
+#   ollama       — langchain_ollama.OllamaEmbeddings (asymmetric embed)
+#   custom       — any class in EMBEDDER_REGISTRY (e.g. UTUELTableEmbedder)
+#
+# All paths are relative to the project root (the folder containing this repo).
+datasets:
+
+  # # ── Baseline: all-MiniLM-L6-v2 (HuggingFace, local) ─────────────────────
+  # - name: test_lookup_WikiSQL
+  #   path: datasets/test_lookup_WikiSQL.jsonl
+  #   embedder:
+  #     type: huggingface
+  #     model_name: sentence-transformers/all-MiniLM-L6-v2
+  #     batch_size: 64
+
+  # # ── Baseline: all-mpnet-base-v2 (HuggingFace, local) ────────────────────
+  # - name: test_lookup_WikiSQL
+  #   path: datasets/test_lookup_WikiSQL.jsonl
+  #   embedder:
+  #     type: huggingface
+  #     model_name: sentence-transformers/all-mpnet-base-v2
+  #     batch_size: 32
+
+  # ── Ollama: nomic-embed-text ──────────────────────────────────────────────
+  # Make sure `ollama pull nomic-embed-text` has been run.
+  # max_chars is optional: omit it (or set to "auto") to auto-detect the model's
+  # context window via /api/show and derive a safe character limit automatically.
+  # - name: test_lookup_WikiSQL
+  #   path: datasets/test_lookup_WikiSQL.jsonl
+  #   embedder:
+  #     type: ollama
+  #     base_url: http://134.184.22.126:10434
+  #     model_name: nomic-embed-text
+  #     batch_size: 1
+  #     # max_chars: auto   # omit or set to "auto" to detect from /api/show
+
+  # # ── Ollama: mxbai-embed-large ─────────────────────────────────────────────
+  # - name: test_lookup_WikiSQL
+  #   path: datasets/test_lookup_WikiSQL.jsonl
+  #   embedder:
+  #     type: ollama
+  #     base_url: http://134.184.22.126:10434
+  #     model_name: all-minilm
+  #     batch_size: 1
+  #     # max_chars: auto   # omit or set to "auto" to detect from /api/show
+
+  # ── UTUEL: U-path node pooling + TableEmbedJePA encoder (all-MiniLM-L6-v2) ─
+  # Uses full U-path SMP pipeline (node_a + node_b from online encoder).
+  # Set type: custom  and  class: UTUELTableEmbedder.  The class is auto-loaded
+  # from table_retrieval/utuel_embedder.py and registered via @register_embedder.
+  - name: test_lookup_WikiSQL
+    path: datasets/test_lookup_WikiSQL.jsonl
+    embedder:
+      type: custom
+      class: UTUELTableEmbedder
+      model_name: UTUEL/all-MiniLM-L6-v2
+      checkpoint_dir: all-MiniLM-L6-v2\2026-06-05_03-28-45_4f036259\final
+      cache_file: test_lookup_WikiSQL_sentence-transformers-all-MiniLM-L6-v2_fc6704d7f3.embed_cache.pt
+      batch_size: 128
+      pool: mean           # mean | max — per-table U-path node pooling
+
+  # ── UTUEL: U-path node pooling + TableEmbedJePA encoder (qwen3-embedding:0.6b)
+  - name: test_lookup_WikiSQL
+    path: datasets/test_lookup_WikiSQL.jsonl
+    embedder:
+      type: custom
+      class: UTUELTableEmbedder
+      model_name: UTUEL/qwen3-embedding:0.6b
+      checkpoint_dir: qwen3-embedding#0.6b\2026-06-05_02-55-06_261f6340\final
+      cache_file: test_lookup_WikiSQL_qwen3-embedding_0.6b_58e3986969.embed_cache.pt
+      batch_size: 64
+      pool: mean
+  
+  - name: test_lookup_WikiSQL
+    path: datasets/test_lookup_WikiSQL.jsonl
+    embedder:
+      type: custom
+      class: UTUELTableEmbedder
+      model_name: UTUEL/nomic-embed-text
+      checkpoint_dir: nomic-embed-text\2026-06-05_06-23-52_b2126004\final
+      cache_file: test_lookup_WikiSQL_nomic-embed-text_56d7a476d6.embed_cache.pt
+      batch_size: 64  
+      pool: mean
+    
+  - name: test_lookup_WikiSQL
+    path: datasets/test_lookup_WikiSQL.jsonl
+    embedder:
+      type: custom
+      class: UTUELTableEmbedder
+      model_name: UTUEL/all-minilm
+      checkpoint_dir: all-minilm\2026-06-05_04-49-38_002e8d45\final
+      cache_file: test_lookup_WikiSQL_all-minilm_901d8e9ffc.embed_cache.pt
+      batch_size: 64
+      pool: mean
+
+  - name: test_lookup_WikiSQL
+    path: datasets/test_lookup_WikiSQL.jsonl
+    embedder:
+      type: custom
+      class: UTUELTableEmbedder
+      model_name: UTUEL/embeddinggemma
+      checkpoint_dir: embeddinggemma\026-06-04_23-48-58_50881565\final
+      cache_file: test_lookup_WikiSQL_embeddinggemma_13fcc3d7b9.embed_cache.pt
+      batch_size: 64
+      pool: mean
+
+    

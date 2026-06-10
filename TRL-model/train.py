@@ -166,6 +166,7 @@ def evaluate_model(
     out_path: Path,
     device: str | None = None,
     top_k_table: int = 2000,
+    run_start_ts: str | None = None,
 ) -> dict:
     """
     Compute cell-retrieval metrics for a trained TableEmbedJePA model.
@@ -236,10 +237,14 @@ def evaluate_model(
         for sp in _SPACES
     }
     tbl_hits: dict[str, list] = {
-        "node_h1": [], "node_h3": [],
-        "col_h1":  [], "col_h3":  [],
-        "row_h1":  [], "row_h3":  [],
-        "tbl_h1":  [], "tbl_h3":  [],
+        "node_h1": [], "node_h3": [], "node_h5": [], "node_h10": [], "node_h20": [],
+        "col_h1":  [], "col_h3":  [], "col_h5":  [], "col_h10":  [], "col_h20":  [],
+        "row_h1":  [], "row_h3":  [], "row_h5":  [], "row_h10":  [], "row_h20":  [],
+        "tbl_h1":  [], "tbl_h3":  [], "tbl_h5":  [], "tbl_h10":  [], "tbl_h20":  [],
+        "tsr_h1":     [], "tsr_h3":     [], "tsr_h5":     [], "tsr_h10":     [], "tsr_h20":     [],
+        "col_tsr_h1": [], "col_tsr_h3": [], "col_tsr_h5": [], "col_tsr_h10": [], "col_tsr_h20": [],
+        "row_tsr_h1": [], "row_tsr_h3": [], "row_tsr_h5": [], "row_tsr_h10": [], "row_tsr_h20": [],
+        "tbl_tsr_h1": [], "tbl_tsr_h3": [], "tbl_tsr_h5": [], "tbl_tsr_h10": [], "tbl_tsr_h20": [],
     }
     per_record: list[dict]             = []
     skipped = 0
@@ -293,27 +298,30 @@ def evaluate_model(
         print(f"\r[eval] encoded {len(tid_to_na)}/{n_tables} tables", end="", flush=True)
 
     print()
-    global_embs     = torch.cat(_glob_parts,     dim=0)  # [N_node_total, d]  CPU
-    global_col_embs = torch.cat(_glob_col_parts, dim=0)  # [N_cols_total, d]
-    global_row_embs = torch.cat(_glob_row_parts, dim=0)  # [N_rows_total, d]
-    global_tbl_embs = torch.cat(_glob_tbl_parts, dim=0)  # [N_tables, d]
-    print(f"[eval] Global indexes \u2014 "
+    global_embs     = torch.cat(_glob_parts,     dim=0).to(device)  # [N_node_total, d]
+    global_col_embs = torch.cat(_glob_col_parts, dim=0).to(device)  # [N_cols_total, d]
+    global_row_embs = torch.cat(_glob_row_parts, dim=0).to(device)  # [N_rows_total, d]
+    global_tbl_embs = torch.cat(_glob_tbl_parts, dim=0).to(device)  # [N_tables, d]
+    print(f"[eval] Global indexes — "
           f"node={global_embs.shape[0]:,}  "
           f"col={global_col_embs.shape[0]:,}  "
           f"row={global_row_embs.shape[0]:,}  "
-          f"tbl={global_tbl_embs.shape[0]:,}")
+          f"tbl={global_tbl_embs.shape[0]:,}  "
+          f"device={global_embs.device}")
 
     # ── Phase 2: evaluate questions (cell retrieval + table retrieval) ─────────
     for tid, rec_idxs in tid_to_rec_idxs.items():
-        na   = tid_to_na.get(tid)
-        nb   = tid_to_nb.get(tid)
-        ups  = tid_to_ups.get(tid)
-        if na is None or nb is None or ups is None:
+        na_cpu = tid_to_na.get(tid)
+        nb_cpu = tid_to_nb.get(tid)
+        ups    = tid_to_ups.get(tid)
+        if na_cpu is None or nb_cpu is None or ups is None:
             skipped += len(rec_idxs)
             continue
 
+        na        = na_cpu.to(device)              # [n, d] on device
+        nb        = nb_cpu.to(device)              # [n, d] on device
         n_up      = len(ups)
-        both_embs = torch.cat([na, nb], dim=0)   # [2n, d]
+        both_embs = torch.cat([na, nb], dim=0)    # [2n, d] on device
 
         def coord_a(i: int) -> tuple[int, int]:
             return (ups[i].tbl_row, ups[i].col_idx_a)
@@ -346,7 +354,7 @@ def evaluate_model(
             with torch.no_grad():
                 q_proj = model.input_projection(q_raw.unsqueeze(1))   # [1, 1, d_out]
                 enc_q, _, _ = model.transformer_encoder(q_proj)
-                q_norm = F.normalize(enc_q[:, 0, :], dim=-1).cpu()    # [1, d_out]
+                q_norm = F.normalize(enc_q[:, 0, :], dim=-1)          # [1, d_out]  on device
 
             def _rank_space(embs: torch.Tensor, coord_fn) -> dict:
                 sims   = (embs @ q_norm.T).squeeze(-1)
@@ -386,27 +394,65 @@ def evaluate_model(
 
             # ── Table retrieval: node / col / row / table level ───────────────────
             def _majority_vote(g_embs: torch.Tensor, g_tids: list) -> tuple:
-                """Top-k cosine sim → majority vote by table_id → top-3 tables."""
+                """Top-k cosine sim → majority vote by table_id → top-20 tables."""
                 _k_   = min(top_k_table, g_embs.shape[0])
                 _tops = [g_tids[i]
                          for i in (g_embs @ q_norm.T).squeeze(-1).topk(_k_).indices.tolist()]
-                _v    = [t for t, _ in Counter(_tops).most_common(3)]
-                return bool(_v) and _v[0] == tid, tid in _v, _v
+                _v    = [t for t, _ in Counter(_tops).most_common(20)]
+                return (bool(_v) and _v[0] == tid,
+                        tid in _v[:3], tid in _v[:5], tid in _v[:10], tid in _v, _v)
+
+            def _top_score_rank(g_embs: torch.Tensor, g_tids: list) -> tuple:
+                """Argsort all node cosine sims; unique table_ids by first-appearance
+                order (= descending max-score per table) → top-20 ranked table list."""
+                _sims = (g_embs @ q_norm.T).squeeze(-1)
+                _k    = min(top_k_table, _sims.shape[0])
+                _top_scores, _top_idx = _sims.topk(_k)          # stays on GPU; only k indices
+                _seen: dict = {}
+                for _j, _i in enumerate(_top_idx.tolist()):     # transfers k ints, not all N
+                    _t = g_tids[_i]
+                    if _t not in _seen:
+                        _seen[_t] = float(_top_scores[_j])
+                        if len(_seen) == 20:
+                            break
+                _v = list(_seen.keys())  # ordered by descending max cosine score
+                return (bool(_v) and _v[0] == tid,
+                        tid in _v[:3], tid in _v[:5], tid in _v[:10], tid in _v, _v)
 
             # Table level: one vector per table → direct cosine rank (no majority vote)
-            _sim_tbl  = (global_tbl_embs @ q_norm.T).squeeze(-1)
-            _top_t    = [_glob_tbl_tids[i]
-                         for i in _sim_tbl.argsort(descending=True).tolist()[:3]]
-            _e1, _e3  = bool(_top_t) and _top_t[0] == tid, tid in _top_t
+            _sim_tbl = (global_tbl_embs @ q_norm.T).squeeze(-1)
+            _top_t   = [_glob_tbl_tids[i]
+                        for i in _sim_tbl.topk(min(20, _sim_tbl.shape[0])).indices.tolist()]
+            _e1  = bool(_top_t) and _top_t[0] == tid
+            _e3  = tid in _top_t[:3]
+            _e5  = tid in _top_t[:5]
+            _e10 = tid in _top_t[:10]
+            _e20 = tid in _top_t
 
-            _n1, _n3, _top_node = _majority_vote(global_embs,     _glob_tids)
-            _c1, _c3, _top_col  = _majority_vote(global_col_embs, _glob_col_tids)
-            _r1, _r3, _top_row  = _majority_vote(global_row_embs, _glob_row_tids)
+            _n1, _n3, _n5, _n10, _n20, _top_node    = _majority_vote(global_embs,     _glob_tids)
+            _c1, _c3, _c5, _c10, _c20, _top_col     = _majority_vote(global_col_embs, _glob_col_tids)
+            _r1, _r3, _r5, _r10, _r20, _top_row     = _majority_vote(global_row_embs, _glob_row_tids)
+            _s1, _s3, _s5, _s10, _s20, _top_tsr     = _top_score_rank(global_embs,    _glob_tids)
+            _cs1, _cs3, _cs5, _cs10, _cs20, _top_col_tsr = _top_score_rank(global_col_embs, _glob_col_tids)
+            _rs1, _rs3, _rs5, _rs10, _rs20, _top_row_tsr = _top_score_rank(global_row_embs, _glob_row_tids)
+            _ts1, _ts3, _ts5, _ts10, _ts20, _top_tbl_tsr = _top_score_rank(global_tbl_embs, _glob_tbl_tids)
 
             tbl_hits["node_h1"].append(float(_n1)); tbl_hits["node_h3"].append(float(_n3))
+            tbl_hits["node_h5"].append(float(_n5)); tbl_hits["node_h10"].append(float(_n10)); tbl_hits["node_h20"].append(float(_n20))
             tbl_hits["col_h1"].append(float(_c1));  tbl_hits["col_h3"].append(float(_c3))
+            tbl_hits["col_h5"].append(float(_c5));  tbl_hits["col_h10"].append(float(_c10));  tbl_hits["col_h20"].append(float(_c20))
             tbl_hits["row_h1"].append(float(_r1));  tbl_hits["row_h3"].append(float(_r3))
+            tbl_hits["row_h5"].append(float(_r5));  tbl_hits["row_h10"].append(float(_r10));  tbl_hits["row_h20"].append(float(_r20))
             tbl_hits["tbl_h1"].append(float(_e1));  tbl_hits["tbl_h3"].append(float(_e3))
+            tbl_hits["tbl_h5"].append(float(_e5));  tbl_hits["tbl_h10"].append(float(_e10));  tbl_hits["tbl_h20"].append(float(_e20))
+            tbl_hits["tsr_h1"].append(float(_s1));   tbl_hits["tsr_h3"].append(float(_s3))
+            tbl_hits["tsr_h5"].append(float(_s5));   tbl_hits["tsr_h10"].append(float(_s10));   tbl_hits["tsr_h20"].append(float(_s20))
+            tbl_hits["col_tsr_h1"].append(float(_cs1)); tbl_hits["col_tsr_h3"].append(float(_cs3))
+            tbl_hits["col_tsr_h5"].append(float(_cs5)); tbl_hits["col_tsr_h10"].append(float(_cs10)); tbl_hits["col_tsr_h20"].append(float(_cs20))
+            tbl_hits["row_tsr_h1"].append(float(_rs1)); tbl_hits["row_tsr_h3"].append(float(_rs3))
+            tbl_hits["row_tsr_h5"].append(float(_rs5)); tbl_hits["row_tsr_h10"].append(float(_rs10)); tbl_hits["row_tsr_h20"].append(float(_rs20))
+            tbl_hits["tbl_tsr_h1"].append(float(_ts1)); tbl_hits["tbl_tsr_h3"].append(float(_ts3))
+            tbl_hits["tbl_tsr_h5"].append(float(_ts5)); tbl_hits["tbl_tsr_h10"].append(float(_ts10)); tbl_hits["tbl_tsr_h20"].append(float(_ts20))
 
             per_record.append({
                 "rec_idx":     rec_idx,
@@ -419,10 +465,14 @@ def evaluate_model(
                 "SMP_bar_node_b": res["SMP_bar_node_b"],
                 "both":           res["both"],
                 "table_retrieval": {
-                    "node": {"Table@1": _n1, "Table@3": _n3, "top_tables": _top_node},
-                    "col":  {"Table@1": _c1, "Table@3": _c3, "top_tables": _top_col},
-                    "row":  {"Table@1": _r1, "Table@3": _r3, "top_tables": _top_row},
-                    "tbl":  {"Table@1": _e1, "Table@3": _e3, "top_tables": _top_t},
+                    "node": {"Table@1": _n1, "Table@3": _n3, "Table@5": _n5, "Table@10": _n10, "Table@20": _n20, "top_tables": _top_node},
+                    "col":  {"Table@1": _c1, "Table@3": _c3, "Table@5": _c5, "Table@10": _c10, "Table@20": _c20, "top_tables": _top_col},
+                    "row":  {"Table@1": _r1, "Table@3": _r3, "Table@5": _r5, "Table@10": _r10, "Table@20": _r20, "top_tables": _top_row},
+                    "tbl":  {"Table@1": _e1, "Table@3": _e3, "Table@5": _e5, "Table@10": _e10, "Table@20": _e20, "top_tables": _top_t[:3]},
+                    "tsr":     {"Table@1": _s1,  "Table@3": _s3,  "Table@5": _s5,  "Table@10": _s10,  "Table@20": _s20,  "top_tables": _top_tsr[:3]},
+                    "col_tsr": {"Table@1": _cs1, "Table@3": _cs3, "Table@5": _cs5, "Table@10": _cs10, "Table@20": _cs20, "top_tables": _top_col_tsr[:3]},
+                    "row_tsr": {"Table@1": _rs1, "Table@3": _rs3, "Table@5": _rs5, "Table@10": _rs10, "Table@20": _rs20, "top_tables": _top_row_tsr[:3]},
+                    "tbl_tsr": {"Table@1": _ts1, "Table@3": _ts3, "Table@5": _ts5, "Table@10": _ts10, "Table@20": _ts20, "top_tables": _top_tbl_tsr[:3]},
                 },
             })
 
@@ -444,13 +494,29 @@ def evaluate_model(
         def _p(k): return round(100 * sum(hits[k]) / n, 2)
         return {
             "node": {"Table@1": _p("node_h1"), "Table@3": _p("node_h3"),
+                     "Table@5": _p("node_h5"), "Table@10": _p("node_h10"), "Table@20": _p("node_h20"),
                      "search_space": f"node_a+node_b (top-{top_k_table} majority vote)"},
             "col":  {"Table@1": _p("col_h1"),  "Table@3": _p("col_h3"),
+                     "Table@5": _p("col_h5"),  "Table@10": _p("col_h10"),  "Table@20": _p("col_h20"),
                      "search_space": f"col_mean(node_a) (top-{top_k_table} majority vote)"},
             "row":  {"Table@1": _p("row_h1"),  "Table@3": _p("row_h3"),
+                     "Table@5": _p("row_h5"),  "Table@10": _p("row_h10"),  "Table@20": _p("row_h20"),
                      "search_space": f"row_mean(node_a) (top-{top_k_table} majority vote)"},
             "tbl":  {"Table@1": _p("tbl_h1"),  "Table@3": _p("tbl_h3"),
+                     "Table@5": _p("tbl_h5"),  "Table@10": _p("tbl_h10"),  "Table@20": _p("tbl_h20"),
                      "search_space": "table_mean(node_a) (direct cosine rank)"},
+            "tsr":     {"Table@1": _p("tsr_h1"),     "Table@3": _p("tsr_h3"),
+                        "Table@5": _p("tsr_h5"),     "Table@10": _p("tsr_h10"),     "Table@20": _p("tsr_h20"),
+                        "search_space": "node_a+node_b (unique by max cosine score)"},
+            "col_tsr": {"Table@1": _p("col_tsr_h1"), "Table@3": _p("col_tsr_h3"),
+                        "Table@5": _p("col_tsr_h5"), "Table@10": _p("col_tsr_h10"), "Table@20": _p("col_tsr_h20"),
+                        "search_space": "col_mean(node_a) (unique by max cosine score)"},
+            "row_tsr": {"Table@1": _p("row_tsr_h1"), "Table@3": _p("row_tsr_h3"),
+                        "Table@5": _p("row_tsr_h5"), "Table@10": _p("row_tsr_h10"), "Table@20": _p("row_tsr_h20"),
+                        "search_space": "row_mean(node_a) (unique by max cosine score)"},
+            "tbl_tsr": {"Table@1": _p("tbl_tsr_h1"), "Table@3": _p("tbl_tsr_h3"),
+                        "Table@5": _p("tbl_tsr_h5"), "Table@10": _p("tbl_tsr_h10"), "Table@20": _p("tbl_tsr_h20"),
+                        "search_space": "table_mean(node_a) (unique by max cosine score)"},
             "n_evaluated": n,
         }
 
@@ -461,28 +527,55 @@ def evaluate_model(
     _eval_cfg_hash = hashlib.md5(_cfg_yaml.encode()).hexdigest()[:8]
     _eval_ts      = datetime.datetime.now().isoformat(timespec="seconds")
 
+    _n_trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    _n_total     = sum(p.numel() for p in model.parameters())
+    _pred_inner  = model.predictor.net[0].out_features  # hidden_size * pred_hidden_mult
+
     results = {
         "metadata": {
-            "timestamp":     _eval_ts,
+            "run_start":     run_start_ts,
+            "eval_timestamp": _eval_ts,
             "cfg_hash":      _eval_cfg_hash,
             "model_class":   type(model).__name__,
-            "hidden_size":   int(cfg.model.hidden_size),
-            "num_layers":    int(cfg.model.num_layers),
-            "num_heads":     int(cfg.model.num_heads),
-            "ema_decay":     float(cfg.model.ema_decay),
-            "ablate_proj":   bool(OmegaConf.select(cfg, "model.ablate_proj", default=False)),
+            "training_mode": cfg.training.get("mode", "global"),
+            "seed":          int(cfg.training.seed),
             "embedder":      cfg.embedder.model_name,
             "data_path":     str(cfg.data.path),
             "max_records":   cfg.data.max_records,
-            "training_mode": cfg.training.get("mode", "global"),
             "n_tables":      n_tables,
             "n_questions":   n_records,
+            "trainable_params": _n_trainable,
+            "total_params":     _n_total,
+            "encoder": {
+                "hidden_size":       int(cfg.model.hidden_size),
+                "num_layers":        int(cfg.model.num_layers),
+                "num_heads":         int(cfg.model.num_heads),
+                "intermediate_size": int(cfg.model.intermediate_size or cfg.model.hidden_size * 4),
+                "attention_dropout": float(cfg.model.attention_dropout),
+                "hidden_dropout":    float(cfg.model.hidden_dropout),
+                "layer_norm_eps":    float(cfg.model.layer_norm_eps),
+                "temperature":       float(cfg.model.temperature),
+                "ema_decay":         float(cfg.model.ema_decay),
+                "ablate_proj":       bool(OmegaConf.select(cfg, "model.ablate_proj", default=False)),
+            },
+            "predictor": {
+                "input_size":   int(cfg.model.hidden_size),
+                "inner_size":   _pred_inner,
+                "output_size":  int(cfg.model.hidden_size),
+                "activation":   "GELU",
+            },
             "loss_weights": {
                 "jepa":     float(cfg.loss.jepa),
                 "jepa_bar": float(cfg.loss.jepa_bar),
                 "local":    float(cfg.loss.local),
                 "global":   float(cfg.loss["global"]),
             },
+            # flat copies kept for backward compat with older analysis cells
+            "hidden_size":   int(cfg.model.hidden_size),
+            "num_layers":    int(cfg.model.num_layers),
+            "num_heads":     int(cfg.model.num_heads),
+            "ema_decay":     float(cfg.model.ema_decay),
+            "ablate_proj":   bool(OmegaConf.select(cfg, "model.ablate_proj", default=False)),
             # "cfg":           OmegaConf.to_container(cfg, resolve=True),
         },
         "metrics":          metrics,
@@ -506,13 +599,13 @@ def evaluate_model(
         )
         print(f"[eval] {m:<14}{vals}")
     print(sep)
-    _TLEVELS = ("node", "col", "row", "tbl")
+    _TLEVELS = ("node", "col", "row", "tbl", "tsr", "col_tsr", "row_tsr", "tbl_tsr")
     _TW = 11
     _n_eval = table_retrieval_metrics["n_evaluated"]
     print(f"\n[eval] Table retrieval  (n={_n_eval}  top-{top_k_table} \u2192 majority vote for node/col/row;  direct rank for tbl)")
     print("[eval]   " + f"{'level':<10}" + "".join(f"{l:>{_TW}}" for l in _TLEVELS))
     print("[eval]   " + "-" * (10 + _TW * len(_TLEVELS)))
-    for _tm in ("Table@1", "Table@3"):
+    for _tm in ("Table@1", "Table@3", "Table@5", "Table@10", "Table@20"):
         print(f"[eval]   {_tm:<10}" + "".join(
             f"{str(table_retrieval_metrics[l][_tm]) + '%':>{_TW}}"
             for l in _TLEVELS))
@@ -611,6 +704,7 @@ def _train_one(
         dm=dm,
         cfg=cfg,
         out_path=ckpt_dir / "eval_results.json",
+        run_start_ts=_run_ts,
     )
     # Return MRR ("both" space) as the Optuna objective; higher is better.
     # Fallback to −train_loss when eval yields no evaluated records.
