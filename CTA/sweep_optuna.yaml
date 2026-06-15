@@ -1,0 +1,69 @@
+# CTA/sweep_optuna.yaml
+# Hydra-Optuna sweep configuration for CTA ablation study.
+#
+# Two independent sweeps are supported — pick whichever stage you want to tune:
+#
+#   Pretraining HPO (TableEmbedJePA on CTA data):
+#     python CTA/pretrain.py --config-name sweep_optuna --multirun
+#
+#   Fine-tuning HPO (column-type classifier):
+#     python CTA/finetune.py --config-name sweep_optuna --multirun
+#
+#   Or via the shell script:
+#     bash CTA/run_train.sh --sweep -s pretrain
+#     bash CTA/run_train.sh --sweep -s finetune
+
+defaults:
+  - config                         # inherit everything from config.yaml
+  - override hydra/sweeper: optuna
+
+hydra:
+  sweeper:
+    direction: maximize            # pretrain: maximise −train_loss; finetune: maximise acc@1
+    study_name: cta_sweep
+    n_trials: 20
+    n_jobs: 1
+    storage: sqlite:///CTA/optuna_cta.db
+    sampler:
+      _target_: optuna.samplers.TPESampler
+      seed: 42
+
+    # ── Search space ──────────────────────────────────────────────────────────
+    # JEPA pretraining ablation (applies to pretrain.py)
+    params:
+      # Optimiser
+      pretraining.lr:           tag(log, interval(1e-5, 1e-3))
+      pretraining.weight_decay: tag(log, interval(1e-4, 1e-1))
+      pretraining.batch_size:   choice(64, 128, 256)
+
+      # JEPA model capacity
+      model.num_layers:         range(1, 5)
+      model.hidden_size:        choice(256, 384, 512)
+
+      # InfoNCE temperature & EMA
+      model.temperature:        tag(log, interval(0.02, 0.20))
+      model.ema_decay:          interval(0.990, 0.999)
+
+      # JEPA loss weights ablation
+      loss.jepa:      interval(0.5, 1.0)
+      loss.jepa_bar:  choice(0.0, 1.0)
+      loss.local:     interval(0.0, 1.0)
+      loss.global:    interval(0.0, 1.0)
+
+      # SMP mode ablation
+      smp.use_graph_walks:      choice(true, false)
+
+      # Fine-tuning ablation (applies to finetune.py)
+      finetuning.lr:            tag(log, interval(1e-5, 1e-3))
+      finetuning.weight_decay:  tag(log, interval(1e-4, 1e-1))
+      finetuning.batch_size:    choice(32, 64, 128)
+      finetuning.label_smoothing: choice(0.0, 0.05, 0.1)
+
+      # Column pooling strategy ablation
+      classifier.pool_mode:     choice(mean, max, cls, attention)
+      classifier.freeze_encoder: choice(true, false)
+
+      # Cell budget ablation
+      data.max_rows_train:  choice(5, 10, 25, 50, null)
+      data.max_rows_dev:    choice(5, 10, 25, null)
+      data.max_rows_test:   choice(1, 5, null)

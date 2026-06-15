@@ -327,7 +327,7 @@ def run_entry(
     return result
 
 
-def main(config_path: str | Path) -> None:
+def main(config_path: str | Path, model_filter: str | None = None, type_filter: str | None = None) -> None:
     config_path = Path(config_path)
     with config_path.open(encoding="utf-8") as f:
         cfg = yaml.safe_load(f)
@@ -350,6 +350,26 @@ def main(config_path: str | Path) -> None:
             p = Path(emb["cache_file"])
             if not p.is_absolute():
                 emb["cache_file"] = str(Path(cache_dir) / p)
+
+    # ── Optional model / type filters ────────────────────────────────────────
+    if model_filter:
+        needle = model_filter.lower()
+        datasets = [
+            ds for ds in datasets
+            if needle in ds.get("embedder", {}).get("model_name", "").lower()
+        ]
+        if not datasets:
+            print(f"[WARN] No entries match --model '{model_filter}'. Check config.yaml model_name values.")
+            return
+    if type_filter:
+        needle = type_filter.lower()
+        datasets = [
+            ds for ds in datasets
+            if ds.get("embedder", {}).get("type", "").lower() == needle
+        ]
+        if not datasets:
+            print(f"[WARN] No entries match --type '{type_filter}'. Valid types: custom, huggingface, ollama.")
+            return
 
     all_results: list[dict] = []
 
@@ -393,5 +413,22 @@ if __name__ == "__main__":
         default=str(_HERE / "config.yaml"),
         help="Path to config.yaml (default: table_retrieval/config.yaml)",
     )
+    parser.add_argument(
+        "--model",
+        default=None,
+        help=(
+            "Only run entries whose embedder model_name contains this substring "
+            "(case-insensitive).  E.g. --model all-MiniLM"
+        ),
+    )
+    parser.add_argument(
+        "--type",
+        default=None,
+        dest="embedder_type",
+        help=(
+            "Only run entries whose embedder type matches exactly "
+            "(case-insensitive).  E.g. --type custom  or  --type huggingface"
+        ),
+    )
     args = parser.parse_args()
-    main(args.config)
+    main(args.config, model_filter=args.model, type_filter=args.embedder_type)

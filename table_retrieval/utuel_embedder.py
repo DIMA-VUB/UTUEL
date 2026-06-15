@@ -39,7 +39,6 @@ YAML entry
 from __future__ import annotations
 
 import sys
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -314,40 +313,10 @@ class UTUELTableEmbedder(TableRetrieverBase):
     # ── Aggregation / TSR helpers ─────────────────────────────────────────────
 
     @staticmethod
-    def _compute_aggregated_embeddings(
-        na: torch.Tensor,   # [n, d] L2-normalised node_a embeddings (CPU)
-        ups: list,           # UPath objects for this table
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """
-        Aggregate node_a embeddings to column, row, and table level.
-
-        col level — one L2-normalised mean vector per unique col_idx_a
-        row level — one L2-normalised mean vector per unique tbl_row
-        tbl level — one L2-normalised mean vector for the whole table
-
-        Returns (col_embs [n_cols, d], row_embs [n_rows, d], tbl_emb [1, d]).
-        Mirrors compute_aggregated_embeddings() in TRL-model/train.py.
-        """
-        col_groups: dict[int, list[int]] = defaultdict(list)
-        row_groups: dict[int, list[int]] = defaultdict(list)
-        for i, up in enumerate(ups):
-            col_groups[up.col_idx_a].append(i)
-            row_groups[up.tbl_row].append(i)
-
-        col_ids  = sorted(col_groups.keys())
-        row_ids  = sorted(row_groups.keys())
-        col_embs = F.normalize(
-            torch.stack([na[col_groups[c]].mean(dim=0) for c in col_ids]), dim=-1)
-        row_embs = F.normalize(
-            torch.stack([na[row_groups[r]].mean(dim=0) for r in row_ids]), dim=-1)
-        tbl_emb  = F.normalize(na.mean(dim=0, keepdim=True), dim=-1)
-        return col_embs, row_embs, tbl_emb
-
-    @staticmethod
     def _top_score_rank(
-        g_embs:  torch.Tensor,   # [N, d]  all node embeddings (on device)
-        g_tids:  list[str],       # [N]     table_id per embedding
-        q_norm:  torch.Tensor,    # [d,]    L2-normalised query embedding (on device)
+        g_embs:  "torch.Tensor | tuple",  # [N, d] tensor OR (na_np, nb_np) tuple
+        g_tids:  list[str],                # [2N]   table_id per embedding
+        q_norm:  torch.Tensor,             # [d,]   L2-normalised query (on device)
         top_k:   int = 2000,
         top_n:   int = 20,
     ) -> list[str]:
@@ -360,7 +329,21 @@ class UTUELTableEmbedder(TableRetrieverBase):
 
         Mirrors _top_score_rank() in TRL-model/train.py.
         """
-        sims       = (g_embs @ q_norm.unsqueeze(-1)).squeeze(-1)  # [N]
+        sims: torch.Tensor
+        if isinstance(g_embs, tuple):
+            # Two-part numpy path: avoids allocating a 4.3 GB contiguous array.
+            # Compute sims for na and nb separately; result vectors are ~22 MB.
+            q_arr = q_norm.cpu().numpy().astype(np.float32)   # [d] fp32
+            sims_a = torch.from_numpy(g_embs[0] @ q_arr)     # [N] fp32
+            sims_b = torch.from_numpy(g_embs[1] @ q_arr)     # [N] fp32
+            sims   = torch.cat([sims_a, sims_b])              # [2N] fp32
+        elif g_embs.is_cuda:
+            sims = (g_embs @ q_norm.to(g_embs.dtype).unsqueeze(-1)).squeeze(-1)
+        else:
+            # CPU tensor path.
+            g_arr = g_embs.numpy()                            # [N, d] fp16 view
+            q_arr = q_norm.cpu().numpy().astype(g_arr.dtype)  # [d]    fp16
+            sims  = torch.from_numpy(g_arr @ q_arr)           # [N]    fp32
         k          = min(top_k, sims.shape[0])
         top_sc, top_ix = sims.topk(k)
         seen: dict[str, float] = {}
@@ -379,19 +362,22 @@ class UTUELTableEmbedder(TableRetrieverBase):
         k_values:         list[int] | None = None,
         top_k_table:      int = 2000,
         mrr_depth:        int = 2000,
+        q_batch_size:     int = 64,
     ) -> dict[str, dict]:
         """
-        Compute Top-Score-Rank (TSR) table retrieval metrics across four spaces:
-          ``tsr``     — global node_a + node_b  (matches training eval)
-          ``col_tsr`` — col-aggregated node_a
-          ``row_tsr`` — row-aggregated node_a
-          ``tbl_tsr`` — table-aggregated node_a
+        Compute Top-Score-Rank (TSR) table retrieval metrics across two spaces:
+          ``tsr``  — global node_a ∪ node_b  (matches training eval)
+          ``tbl``  — table-level avg embedding (one L2-normalised vector per table)
 
         Must be called *after* ``encode_table_corpus_variants()`` so that the
         global node indexes (``self._global_*_embs`` / ``self._global_*_tids``)
         are populated.
 
-        Returns a dict ``{space_name: {"Hit@k": float, ...}}`` for each space.
+        ``q_batch_size`` controls how many queries are batched into one BLAS-3
+        matmul for the ``tsr`` space.  Larger = faster (more cache-efficient)
+        but uses more RAM (each batch ≈ 2 × N × C × 4 bytes).
+
+        Returns a dict ``{space_name: {"MRR": float, "Hit@k": float, ...}}``.
         """
         if not hasattr(self, "_global_node_embs"):
             raise RuntimeError(
@@ -401,42 +387,70 @@ class UTUELTableEmbedder(TableRetrieverBase):
         if k_values is None:
             k_values = [1, 3, 5, 10, 20]
 
-        spaces = {
-            "tsr":     (self._global_node_embs, self._global_node_tids),
-            "col_tsr": (self._global_col_embs,  self._global_col_tids),
-            "row_tsr": (self._global_row_embs,  self._global_row_tids),
-            "tbl_tsr": (self._global_tbl_embs,  self._global_tbl_tids),
-        }
-        # Move to inference device once
-        spaces_dev = {k: (e.to(self.device), t) for k, (e, t) in spaces.items()}
-
-        hits = {sp: {k: 0 for k in k_values} for sp in spaces}
-        rr   = {sp: [] for sp in spaces}   # reciprocal ranks for MRR
+        hits = {"tsr": {k: 0 for k in k_values},
+                "tbl":  {k: 0 for k in k_values}}
+        rr: dict[str, list[float]] = {"tsr": [], "tbl": []}
         n    = len(gold_ids)
-        # Collect enough unique tables to satisfy both Hit@k and MRR
-        hit_depth = max(k_values)       # minimum unique tables needed for Hit@k
-        top_n     = max(hit_depth, mrr_depth)
+        top_n = max(max(k_values), mrr_depth)
 
-        q_tensor = torch.tensor(
-            query_embeddings, dtype=torch.float32, device=self.device,
-        )   # [Q, d]
+        tsr_na, tsr_nb = self._global_node_embs      # [N, d] fp32 numpy each
+        tsr_tids       = self._global_node_tids       # list[str] length 2N
 
-        for q_idx, gold_tid in enumerate(gold_ids):
-            q_norm = q_tensor[q_idx]   # [d]
-            for sp, (g_embs, g_tids) in spaces_dev.items():
-                ranked = self._top_score_rank(g_embs, g_tids, q_norm, top_k_table, top_n)
-                for k in k_values:
-                    if gold_tid in ranked[:k]:
-                        hits[sp][k] += 1
-                # MRR: reciprocal rank within the top mrr_depth unique tables
-                mrr_ranked = ranked[:mrr_depth]
-                try:
-                    rank = mrr_ranked.index(gold_tid) + 1   # 1-based
-                    rr[sp].append(1.0 / rank)
-                except ValueError:
-                    rr[sp].append(0.0)
-            if (q_idx + 1) % 200 == 0 or q_idx == n - 1:
-                print(f"  [UTUEL] TSR eval: {q_idx + 1}/{n}", end="\r", flush=True)
+        tbl_embs = self._global_tbl_embs              # [T', d] fp32 GPU tensor
+        tbl_tids = self._global_tbl_tids              # list[str] length T'
+
+        Q_arr    = query_embeddings.astype(np.float32)
+        q_tensor = torch.tensor(query_embeddings, dtype=torch.float32, device=self.device)
+
+        def _dedup_rank(sims_np: np.ndarray, g_tids: list[str]) -> list[str]:
+            """
+            Sort ALL node sims descending → walk in order → collect unique
+            table_ids by first appearance (= max cosine per table) until top_n
+            unique tables are found.
+            """
+            order = np.argsort(-sims_np)
+            seen: dict[str, float] = {}
+            for ix in order:
+                t = g_tids[int(ix)]
+                if t not in seen:
+                    seen[t] = float(sims_np[ix])
+                    if len(seen) == top_n:
+                        break
+            return list(seen.keys())
+
+        def _score(ranked: list[str], gold_tid: str, sp: str) -> None:
+            for k in k_values:
+                if gold_tid in ranked[:k]:
+                    hits[sp][k] += 1
+            try:
+                rr[sp].append(1.0 / (ranked[:mrr_depth].index(gold_tid) + 1))
+            except ValueError:
+                rr[sp].append(0.0)
+
+        for q_start in range(0, n, q_batch_size):
+            q_end   = min(q_start + q_batch_size, n)
+            q_chunk = Q_arr[q_start:q_end]                    # [C, d]
+
+            # BLAS-3 matmuls — shared for both node spaces
+            sims_a_batch = tsr_na @ q_chunk.T                 # [N, C]
+            sims_b_batch = tsr_nb @ q_chunk.T                 # [N, C]
+
+            for j in range(q_end - q_start):
+                q_idx    = q_start + j
+                gold_tid = gold_ids[q_idx]
+
+                # tsr: node_a ∪ node_b
+                sims_ab = np.concatenate([sims_a_batch[:, j], sims_b_batch[:, j]])
+                _score(_dedup_rank(sims_ab, tsr_tids), gold_tid, "tsr")
+
+                # tbl: table-level avg embedding (already one per table)
+                q_norm   = q_tensor[q_idx]
+                tbl_sims = (tbl_embs @ q_norm.unsqueeze(-1)).squeeze(-1).cpu().numpy()
+                tbl_ranked = [tbl_tids[i] for i in np.argsort(-tbl_sims)[:top_n]]
+                _score(tbl_ranked, gold_tid, "tbl")
+
+            if q_end % 200 < q_batch_size or q_end == n:
+                print(f"  [UTUEL] TSR eval: {q_end}/{n}", end="\r", flush=True)
         print()
 
         return {
@@ -444,7 +458,7 @@ class UTUELTableEmbedder(TableRetrieverBase):
                 "MRR": round(sum(rr[sp]) / n, 4),
                 **{f"Hit@{k}": round(hits[sp][k] / n, 4) for k in k_values},
             }
-            for sp in spaces
+            for sp in ("tsr", "tbl")
         }
 
     # ── Abstract interface ────────────────────────────────────────────────────
@@ -528,80 +542,86 @@ class UTUELTableEmbedder(TableRetrieverBase):
             print(f"  [UTUEL] encode U-paths: {done}/{total_upaths}", end="\r", flush=True)
         print()
 
-        node_a_all = torch.cat(all_node_a, dim=0)   # [total_upaths, d_out]
-        node_b_all = torch.cat(all_node_b, dim=0)   # [total_upaths, d_out]
+        print(f"  [UTUEL] concatenating node embeddings …", flush=True)
+        node_a_all = torch.cat(all_node_a, dim=0)   # [total_upaths, d_out]  CPU  fp32
+        node_b_all = torch.cat(all_node_b, dim=0)   # [total_upaths, d_out]  CPU  fp32
 
-        # ── Step 5: build global node index (unpooled, for TSR eval) ──────────
-        #   Mirrors Phase 1 in TRL-model/train.py:evaluate_model().
-        #   node_a + node_b from every table are concatenated into one index;
-        #   col/row/table aggregates are built from node_a only.
-        _glob_node_parts: list[torch.Tensor] = []
-        _glob_node_tids:  list[str]          = []
-        _glob_col_parts:  list[torch.Tensor] = []
-        _glob_col_tids:   list[str]          = []
-        _glob_row_parts:  list[torch.Tensor] = []
-        _glob_row_tids:   list[str]          = []
-        _glob_tbl_parts:  list[torch.Tensor] = []
-        _glob_tbl_tids:   list[str]          = []
+        # ── Steps 5 & 6: vectorized scatter_add ──────────────────────────────
+        # Build per-upath index arrays from flat_upaths metadata — no Python loop.
+        N  = total_upaths
+        d  = node_a_all.shape[1]
+        dev = self.device
 
-        for tbl_idx, (s, e) in enumerate(table_ranges):
-            if s == e:
-                continue
-            tid      = str(records[tbl_idx].get("table_id", tbl_idx))
-            na_chunk = node_a_all[s:e]    # [n_paths, d_out]  CPU
-            nb_chunk = node_b_all[s:e]    # [n_paths, d_out]  CPU
-            n_up     = e - s
+        print(f"  [UTUEL] building upath index arrays …", flush=True)
+        n_up_per_tbl    = np.array([e - s for s, e in table_ranges], dtype=np.int64)
+        table_assign_np = np.repeat(np.arange(T, dtype=np.int64), n_up_per_tbl)  # [N]
 
-            # node_a and node_b together span the global node search space
-            _glob_node_parts.append(na_chunk)
-            _glob_node_parts.append(nb_chunk)
-            _glob_node_tids.extend([tid] * (n_up * 2))
+        tid_per_table  = [str(records[i].get("table_id", i)) for i in range(T)]
+        tids_per_upath = [tid_per_table[i] for i in table_assign_np.tolist()]
 
-            # Col / row / table aggregation from node_a only
-            ups_tbl = flat_upaths[s:e]
-            col_embs, row_embs, tbl_emb = self._compute_aggregated_embeddings(
-                na_chunk, ups_tbl,
-            )
-            _glob_col_parts.append(col_embs)
-            _glob_col_tids.extend([tid] * col_embs.shape[0])
-            _glob_row_parts.append(row_embs)
-            _glob_row_tids.extend([tid] * row_embs.shape[0])
-            _glob_tbl_parts.append(tbl_emb)
-            _glob_tbl_tids.append(tid)
+        # ── Table-level aggregation: sort + reduceat on CPU ───────────────────
+        # scatter_add_ and index_add_ on CUDA both use atomicAdd internally.
+        # With N≈1.4M paths aggregating into T≈4K tables (≈330 paths/table),
+        # atomic write-contention is extreme — every output element receives
+        # ~330 concurrent atomic writes, which the SM serialises completely.
+        # Fix: sort by table index on CPU, then use np.add.reduceat — a
+        # contiguous segmented sum with zero atomic contention.
+        print(f"  [UTUEL] sort + reduceat aggregation (CPU) …", flush=True)
+        na_np = node_a_all.numpy()   # [N, d] — fp32  CPU
+        nb_np = node_b_all.numpy()   # [N, d] — fp32  CPU
 
-        # Store as instance attributes; evaluation via compute_tsr_metrics()
-        self._global_node_embs = torch.cat(_glob_node_parts, dim=0)   # [N_nodes, d]
-        self._global_node_tids = _glob_node_tids
-        self._global_col_embs  = torch.cat(_glob_col_parts,  dim=0)   # [N_cols,  d]
-        self._global_col_tids  = _glob_col_tids
-        self._global_row_embs  = torch.cat(_glob_row_parts,  dim=0)   # [N_rows,  d]
-        self._global_row_tids  = _glob_row_tids
-        self._global_tbl_embs  = torch.cat(_glob_tbl_parts,  dim=0)   # [N_tbls,  d]
-        self._global_tbl_tids  = _glob_tbl_tids
-        print(f"  [UTUEL] Global node index — "
-              f"node={self._global_node_embs.shape[0]:,}  "
-              f"col={self._global_col_embs.shape[0]:,}  "
-              f"row={self._global_row_embs.shape[0]:,}  "
+        order       = np.argsort(table_assign_np, kind='stable')          # [N]
+        na_s        = na_np[order]                                         # [N, d] sorted by table
+        nb_s        = nb_np[order]                                         # [N, d]
+        cnt_np      = np.bincount(table_assign_np, minlength=T)           # [T] int64
+        seg_starts  = cnt_np.cumsum() - cnt_np                            # [T] start index per segment
+        nonempty_ix = np.where(cnt_np > 0)[0]
+
+        tbl_sum_a_np = np.zeros((T, d), dtype=np.float32)
+        tbl_sum_b_np = np.zeros((T, d), dtype=np.float32)
+        if len(nonempty_ix):
+            tbl_sum_a_np[nonempty_ix] = np.add.reduceat(na_s, seg_starts[nonempty_ix])
+            tbl_sum_b_np[nonempty_ix] = np.add.reduceat(nb_s, seg_starts[nonempty_ix])
+
+        # Transfer only the small aggregated result [T, d] to device for F.normalize
+        tbl_sum_a = torch.from_numpy(tbl_sum_a_np).to(dev)                # [T, d]
+        tbl_sum_b = torch.from_numpy(tbl_sum_b_np).to(dev)                # [T, d]
+        tbl_cnt   = torch.from_numpy(cnt_np.astype(np.float32)).to(dev)   # [T]
+        safe_cnt  = tbl_cnt.unsqueeze(1).clamp(min=1)
+
+        tbl_mean_a = F.normalize(tbl_sum_a / safe_cnt, dim=-1)   # [T, d]
+        tbl_mean_b = F.normalize(tbl_sum_b / safe_cnt, dim=-1)   # [T, d]
+
+        # ── Step 6: pooled table embeddings (three variants) ─────────────────
+        table_embs_a = tbl_mean_a.cpu().numpy().astype(np.float32)
+        table_embs_b = tbl_mean_b.cpu().numpy().astype(np.float32)
+        if self.pool_mode == "max":
+            table_embs_both = F.normalize(
+                torch.maximum(tbl_mean_a, tbl_mean_b), dim=-1,
+            ).cpu().numpy().astype(np.float32)
+        else:
+            table_embs_both = F.normalize(
+                (tbl_mean_a + tbl_mean_b) / 2, dim=-1,
+            ).cpu().numpy().astype(np.float32)
+
+        # ── Step 5a: node global index — kept on CPU fp32 ────────────────────
+        # np.concatenate([na_np, nb_np]) would allocate ~8.6 GB of contiguous
+        # RAM (2.8M × 768 × 4 bytes) — that hangs too.  Store as a tuple;
+        # _top_score_rank computes sims in two passes (result vectors are tiny).
+        print(f"  [UTUEL] building global node index (CPU fp32, split) …", flush=True)
+        self._global_node_embs = (na_np, nb_np)  # tuple of [N, d] fp32 numpy
+        self._global_node_tids = tids_per_upath + tids_per_upath
+
+        # ── Step 5b: table-level global index — no longer used for TSR ──────────
+        # (kept so external callers can still access _global_tbl_embs if needed)
+        non_empty = tbl_cnt.nonzero(as_tuple=True)[0]
+        _both_tensor = torch.from_numpy(table_embs_both).to(dev)
+        self._global_tbl_embs = _both_tensor[non_empty]
+        self._global_tbl_tids = [tid_per_table[i] for i in non_empty.tolist()]
+
+        print(f"  [UTUEL] Global node index ({dev}) — "
+              f"node={len(self._global_node_tids):,}  "
               f"tbl={self._global_tbl_embs.shape[0]:,}")
-
-        # ── Step 6: per-table pooling (three variants) ────────────────────────
-        #   node_a : L2-norm(mean(node_a))              — mirrors train.py tbl for SMP
-        #   node_b : L2-norm(mean(node_b))              — mirrors train.py tbl for SMP_bar
-        #   both   : mean of the two unit vectors, re-normalised
-        table_embs_a    = np.zeros((T, self.dim), dtype=np.float32)
-        table_embs_b    = np.zeros((T, self.dim), dtype=np.float32)
-        table_embs_both = np.zeros((T, self.dim), dtype=np.float32)
-
-        for tbl_idx, (s, e) in enumerate(table_ranges):
-            if s == e:
-                continue   # table had no U-paths — stays zero
-            na_chunk = node_a_all[s:e]                          # [n_paths, d_out]
-            nb_chunk = node_b_all[s:e]                          # [n_paths, d_out]
-            mean_a = F.normalize(na_chunk.mean(dim=0, keepdim=True), dim=-1)  # [1, d_out]
-            mean_b = F.normalize(nb_chunk.mean(dim=0, keepdim=True), dim=-1)  # [1, d_out]
-            table_embs_a[tbl_idx]    = mean_a.squeeze(0).cpu().numpy()
-            table_embs_b[tbl_idx]    = mean_b.squeeze(0).cpu().numpy()
-            table_embs_both[tbl_idx] = self._pool(torch.cat([mean_a, mean_b], dim=0))
 
         return {"node_a": table_embs_a, "node_b": table_embs_b, "both": table_embs_both}
 

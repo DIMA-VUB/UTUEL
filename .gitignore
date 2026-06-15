@@ -18,3 +18,11 @@ __pycache__/
 *.ckpt
 *.db
 '*
+
+datasets_TRL/**
+CTA/checkpoints/**
+CTA/lightning_logs/**
+CTA/outputs/**
+CTA/CTA/**
+CTA/multirun/**
+CTA/optuna.db

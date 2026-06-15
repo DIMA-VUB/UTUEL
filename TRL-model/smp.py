@@ -127,9 +127,28 @@ def generate_u_paths_flat(
 
     Each U-path traces:  (0,j) down► (i,j) right► (i,k) up► (0,k)
     text: col_header_j | cell(i,j) | cell(i,k) | col_header_k
+
+    Single-column tables: node_a == node_b and pivot_a == pivot_b
+    (the U-path collapses to a self-path on the only column).
     """
     out: list[UPath] = []
     n = len(header)
+
+    if n == 1:
+        # Self-path: pivot_a == pivot_b, node_a == node_b
+        h = str(header[0]).strip()
+        for row_idx, row in enumerate(rows):
+            cell = str(row[0]).strip() if row else ""
+            out.append(UPath(
+                row_idx=row_idx,
+                col_idx_a=0,  col_idx_b=0,
+                col_header_a=h,
+                cell_value_a=cell,
+                cell_value_b=cell,
+                col_header_b=h,
+            ))
+        return out
+
     for row_idx, row in enumerate(rows):
         for j in range(n):
             ca = str(row[j]).strip() if j < len(row) else ""
@@ -172,7 +191,7 @@ def walks_to_u_paths(
             except ValueError:
                 continue
 
-            # Pattern: header → data_a → data_b → header (same row, diff cols)
+    # Pattern: header → data_a → data_b → header (same row, diff cols)
             if not (r0 == 0 and r1 > 0 and r2 > 0 and r3 == 0
                     and r1 == r2 and c1 != c2
                     and c0 == c1 and c3 == c2):
@@ -209,6 +228,11 @@ def generate_u_paths_from_graph(
     the walker produces no usable walks.
     """
     if not rows:
+        return generate_u_paths_flat(header, rows)
+
+    if len(header) == 1:
+        # Single-column table: graph walks can't form a valid U-path pair;
+        # fall back to self-paths directly.
         return generate_u_paths_flat(header, rows)
 
     G = build_table_graph(header, rows)

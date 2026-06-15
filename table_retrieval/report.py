@@ -27,6 +27,9 @@ PROJECT_ROOT = _HERE.parent
 # Metrics columns shown in the report (in order)
 METRIC_COLS = ["MRR", "Hit@1", "Hit@3", "Hit@5", "Hit@10", "Hit@20"]
 
+# TSR sub-spaces reported as extra columns when present (tsr is already the primary MRR/Hit@k)
+TSR_SPACES = ["tbl"]
+
 
 def load_results(results_dir: Path) -> list[dict]:
     """
@@ -64,9 +67,21 @@ def build_report_df(results: list[dict]) -> pd.DataFrame:
                 + r.get("embed_time_queries_s", 0)
             ),
         }
-        metrics = r.get("metrics", {})
+        tsr_vm   = r.get("tsr_variant_metrics") or {}
+        tsr_main = tsr_vm.get("tsr", {})   # primary metrics for UTUEL models
+        # For UTUEL models (tsr_variant_metrics present) use the tsr space as
+        # the primary MRR/Hit@k columns; otherwise fall back to standard metrics.
+        primary  = tsr_main if tsr_main else r.get("metrics", {})
         for col in METRIC_COLS:
-            record[col] = metrics.get(col, float("nan"))
+            record[col] = primary.get(col, float("nan"))
+        # Extra TSR sub-space columns (tbl_MRR, tbl_Hit@k, …)
+        # "tbl_tsr" is the legacy key name; "tbl" is the current one.
+        _TSR_ALIASES = {"tbl": ["tbl", "tbl_tsr"]}
+        for sp in TSR_SPACES:
+            aliases = _TSR_ALIASES.get(sp, [sp])
+            sp_m = next((tsr_vm[k] for k in aliases if k in tsr_vm), {})
+            for col in METRIC_COLS:
+                record[f"{sp}_{col}"] = sp_m.get(col, float("nan"))
         records.append(record)
 
     df = pd.DataFrame(records)
@@ -79,7 +94,8 @@ def build_report_df(results: list[dict]) -> pd.DataFrame:
 def format_markdown(df: pd.DataFrame) -> str:
     """Render DataFrame as a Markdown table with 4-decimal metric formatting."""
     display = df.copy()
-    for col in METRIC_COLS:
+    tsr_metric_cols = [f"{sp}_{col}" for sp in TSR_SPACES for col in METRIC_COLS]
+    for col in METRIC_COLS + tsr_metric_cols:
         if col in display.columns:
             display[col] = display[col].map(lambda v: f"{v:.4f}" if pd.notna(v) else "—")
     if "embed_time_s" in display.columns:
@@ -101,7 +117,8 @@ def format_markdown(df: pd.DataFrame) -> str:
 def format_html(df: pd.DataFrame) -> str:
     """Render DataFrame as a styled HTML table."""
     display = df.copy()
-    for col in METRIC_COLS:
+    tsr_metric_cols = [f"{sp}_{col}" for sp in TSR_SPACES for col in METRIC_COLS]
+    for col in METRIC_COLS + tsr_metric_cols:
         if col in display.columns:
             display[col] = display[col].map(lambda v: f"{v:.4f}" if pd.notna(v) else "—")
     if "embed_time_s" in display.columns:

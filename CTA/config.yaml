@@ -1,0 +1,165 @@
+# CTA/config.yaml
+# All hyperparameters for Column Type Annotation (CTA) training.
+#
+# Pipeline:
+#   Stage 1 — Pretraining  : TableEmbedJePA on CTA .table_col_type data
+#                             (same JEPA + SMP regime as TRL-model, different dataset)
+#   Stage 2 — Fine-tuning  : column-level embeddings from the pretrained encoder
+#                             → CTAClassifier (multi-class CrossEntropy over type_vocab)
+#
+# Override any value on the command line (Hydra syntax), e.g.:
+#   python CTA/pretrain.py  pretraining.epochs=50 model.hidden_size=512
+#   python CTA/finetune.py  finetuning.lr=3e-4  model.pool_mode=attention
+
+# ── Hardware ─────────────────────────────────────────────────────────────────
+# Set to 'high' or 'medium' to enable Tensor Core acceleration on NVIDIA GPUs.
+matmul_precision: high
+
+# ── JEPA model architecture (used by both pretrain and finetune) ──────────────
+# These settings are identical to TRL-model/config.yaml — the same
+# TableEmbedJePA architecture is pretrained on CTA data.
+model:
+  hidden_size: 384          # transformer working dimension (embed_dim_out)
+  num_layers: 1
+  num_heads: 12             # must divide hidden_size; auto-adjusted if needed
+  intermediate_size: null   # null = hidden_size * 4
+  attention_dropout: 0.1
+  hidden_dropout: 0.1
+  layer_norm_eps: 1.0e-12
+  temperature: 0.07         # InfoNCE softmax temperature
+  beta: 0.5                 # reserved contrastive weighting scalar
+  ema_decay: 0.996          # EMA decay rate for target encoder update
+  ablate_proj: true         # true = replace input_projection with nn.Identity
+                             # (requires hidden_size == embed_dim)
+
+# ── JEPA loss weights (pretraining stage) ─────────────────────────────────────
+# Each weight scales its loss term.  Set to 0.0 to disable a term.
+loss:
+  jepa: 1.0      # JEPA prediction loss  — predictor(h_node_a) ≈ target_enc(query)[CLS]
+  jepa_bar: 1.0  # JEPA bar loss         — predictor(h_node_b from SMP_bar) ≈ target_enc(query)[CLS]
+  local: 1.0     # local InfoNCE         — node_a ↔ {pivot_a, node_b, pivot_b}
+  global: 1.0    # global SMP InfoNCE    — CLS[SMP[i]] ↔ CLS[SMP_bar[i]]
+
+# ── SMP generation (pretraining stage) ───────────────────────────────────────
+# Controls how U-paths are produced from each CTA table.
+smp:
+  use_graph_walks: false  # false = row-major flat enumeration (faster, recommended)
+                           # true  = graph-walk SMP (richer but slower)
+  num_walks: 50           # random walks per header (graph mode only)
+  chunk_size: 1           # sub-graph chunk size for large tables (graph mode)
+
+# ── CTA classifier (fine-tuning stage) ───────────────────────────────────────
+# Multi-label, multi-class classification: each column can carry several
+# Freebase types simultaneously.  Loss = BCEWithLogitsLoss per class.
+# Prediction threshold is applied to sigmoid(logits) to produce binary predictions.
+classifier:
+  pool_mode: mean          # 'mean' | 'max' | 'cls' | 'attention'
+                            # aggregates node_a embeddings → column embedding
+  freeze_encoder: false    # true = freeze the pretrained JEPA encoder weights
+  embed_mode: column       # 'column' : mean-pool all node reps → one emb per column
+                            # 'cell'   : keep each node rep separately;
+                            #            final prediction = average logits (soft majority vote)
+  intermediate_size: null   # null = LayerNorm→Linear only; int = add hidden layer
+                            #   LayerNorm→Linear(embed_dim, N)→GELU→Dropout→Linear(N, num_classes)
+  include_header_emb: true # true = include the column's own header node embedding in the
+                            #   column-level mean-pool (alongside the cell node reps).
+                            #   In cell mode the header is appended as an extra cell entry.
+                            #   Header emb is taken from pivot_a/pivot_b of the first U-path.
+  smp_source: smp          # which SMP view to extract the node embedding from for the classifier
+                            # 'smp'     : forward  [pivot_a, node_a, node_b, pivot_b]
+                            #             → extracts node_a in its forward context
+                            # 'smp_bar' : reversed [pivot_b, node_b, node_a, pivot_a]
+                            #             → extracts node_b in its reverse context
+                            # 'both'    : mean of both node embeddings
+                            # (no encoder: smp=node_a raw emb, smp_bar=node_b raw emb)
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+data:
+  # Optional shortcut: set folder to derive all paths automatically.
+  # e.g. folder: "datasets/cta_v2"  → loads train/dev/test.table_col_type + type_vocab from there.
+  # null = use the explicit paths below.
+  folder: null
+
+  # Paths to the .table_col_type JSON datasets (DIMA-VUB/UTUEL format).
+  # Ignored when folder is set.
+  train_path:      "datasets/train.table_col_type.json"
+  dev_path:        "datasets/dev.table_col_type.json"
+  test_path:       "datasets/test.table_col_type.json"
+
+  # Path to type_vocab — one Freebase type string per line (label = line index).
+  type_vocab_path: "datasets/type_vocab.txt"
+
+  # Maximum records to load per split (null = all).
+  max_records: null
+
+  # Maximum rows used per table when generating U-paths — set per split.
+  # null = use all rows.  Useful for fast prototyping / ablation.
+  max_rows_train: 5    # first N rows of each table during training
+  max_rows_dev:   5    # first N rows during validation
+  max_rows_test:  1    # first N rows during test (faster, evaluation only)
+
+# ── Embedder ──────────────────────────────────────────────────────────────────
+# Same backends as TRL-model: 'openai' | 'huggingface' | <Ollama model name>
+embedder:
+  model_type: huggingface
+  base_url: http://127.0.0.1:11434/   # Ollama server (ignored for other backends)
+  model_name: sentence-transformers/all-MiniLM-L6-v2
+  api_key: null
+  precompute: true           # batch-embed all unique node texts at dataset init
+  embed_batch_size: 64
+  embed_dim: 384             # must match the model output (384 for all-MiniLM-L6-v2)
+  cache_embeddings: true
+  embed_cache_dir: CTA/.cache
+
+# ── Query templates (pretraining) ─────────────────────────────────────────────
+# Same placeholders as TRL-model: pivot_a, node_a, node_b, pivot_b.
+query:
+  cat_qry_template:     "{pivot_b} ... {pivot_a}({node_a})?"
+  cat_qry_bar_template: "{pivot_a} ... {pivot_b}({node_b})?"
+
+# ── Pretraining ────────────────────────────────────────────────────────────────
+pretraining:
+  output_dir: CTA/checkpoints/pretrain
+  epochs: 50
+  batch_size: 128           # must be even (query-loss pairing)
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  max_grad_norm: 2.0
+  fp16: false
+  bf16: false
+  dataloader_num_workers: 4
+  logging_steps: 10
+  save_total_limit: 3
+  seed: 42
+  early_stopping_patience: 5
+  early_stopping_min_delta: 1.0e-4
+  ckpt_path: null           # resume from checkpoint (path relative to repo root)
+
+# ── Fine-tuning ────────────────────────────────────────────────────────────────
+finetuning:
+  # Path to a pretrained TableEmbedJePA checkpoint (from pretraining stage).
+  # Set null to train the classifier on raw LLM cell embeddings (no JEPA encoder).
+  pretrained_ckpt: null
+  output_dir: CTA/checkpoints/finetune
+  epochs: 20
+  batch_size: 64
+  lr: 3.0e-4
+  weight_decay: 1.0e-2
+  max_grad_norm: 1.0
+  fp16: false
+  bf16: false
+  dataloader_num_workers: 4
+  logging_steps: 10
+  save_total_limit: 3
+  seed: 42
+  label_smoothing: 0.0      # CrossEntropy label-smoothing epsilon
+  early_stopping_patience: 5
+  early_stopping_min_delta: 1.0e-4
+  ckpt_path: null
+
+# ── Evaluation ─────────────────────────────────────────────────────────────────
+eval:
+  threshold: 0.5            # sigmoid threshold for multi-label binary prediction;
+                             # applied to sigmoid(logits) before computing
+                             # precision, recall and F1 (torchmetrics)
+  output_dir: CTA/outputs
