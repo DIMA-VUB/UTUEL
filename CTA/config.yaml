@@ -20,7 +20,7 @@ matmul_precision: high
 # TableEmbedJePA architecture is pretrained on CTA data.
 model:
   hidden_size: 384          # transformer working dimension (embed_dim_out)
-  num_layers: 1
+  num_layers: 3
   num_heads: 12             # must divide hidden_size; auto-adjusted if needed
   intermediate_size: null   # null = hidden_size * 4
   attention_dropout: 0.1
@@ -102,7 +102,7 @@ data:
 # Same backends as TRL-model: 'openai' | 'huggingface' | <Ollama model name>
 embedder:
   model_type: huggingface
-  base_url: http://127.0.0.1:11434/   # Ollama server (ignored for other backends)
+  base_url: http://127.0.0.1:11434/ # Ollama server (ignored for other backends)
   model_name: sentence-transformers/all-MiniLM-L6-v2
   api_key: null
   precompute: true           # batch-embed all unique node texts at dataset init
@@ -125,7 +125,7 @@ pretraining:
   lr: 1.0e-4
   weight_decay: 1.0e-2
   max_grad_norm: 2.0
-  fp16: false
+  fp16: true
   bf16: false
   dataloader_num_workers: 4
   logging_steps: 10
@@ -146,7 +146,7 @@ finetuning:
   lr: 3.0e-4
   weight_decay: 1.0e-2
   max_grad_norm: 1.0
-  fp16: false
+  fp16: true
   bf16: false
   dataloader_num_workers: 4
   logging_steps: 10

@@ -607,7 +607,7 @@ class TableEmbedJePA(pl.LightningModule):
             weight_decay=self.weight_decay,
         )
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=self.max_epochs, eta_min=1e-6
+            optimizer, T_max=self.max_epochs, eta_min=self.lr
         )
         return {
             "optimizer": optimizer,

@@ -38,6 +38,8 @@ Metrics reported on dev and test (multi-label, multi-class):
 
 from __future__ import annotations
 
+import datetime
+import hashlib
 import json
 import sys
 from collections import defaultdict
@@ -47,7 +49,7 @@ import hydra
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from pytorch_lightning.callbacks import (
     EarlyStopping,
     LearningRateMonitor,
@@ -108,30 +110,37 @@ def extract_column_embeddings(
     type2idx: dict[str, int],
     col_types_per_table: dict[str, list[list[str]]],   # table_id → [n_cols][n_types]
     embed_mode: str = "column",   # 'column' | 'cell'
-    include_header_emb: bool = False,
+    smp_source: str = "smp",     # 'smp' | 'smp_bar' | 'both'
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
-    Extract per-column (or per-cell) **raw LLM** node embeddings for every
-    labelled column.  The JEPA encoder (if any) lives inside CTAClassifier and
-    runs online in forward(), so freeze_encoder actually controls gradients.
+    Extract raw LLM U-path embeddings for every labelled column.
 
-    embed_mode='column'  (default)
-        Mean-pool all raw node reps that belong to a column → one [d_llm] vector
-        per (table, col) pair.  The encoder maps this to [d_model] in forward().
+    The JEPA encoder runs **online** inside ``CTAClassifier.forward``, which
+    sees the full 4-token U-path [pivot_a, node_a, node_b, pivot_b] and then
+    selects output positions based on ``smp_source`` / ``embed_mode``.
+    This function only extracts the raw LLM cache; no pooling or selection here.
+
+    smp_source controls which U-paths are eligible for a column:
+        'smp'     → column must appear as col_a  (node_a = this col's cell, position [1])
+        'smp_bar' → column must appear as col_b  (node_b = this col's cell, position [2])
+        'both'    → all U-paths involving this column (a-side and b-side)
+
+    embed_mode='column'
+        One sample per (table, column): position-wise mean-pool across eligible U-paths
+        → [4, d_llm].
 
     embed_mode='cell'
-        Keep each raw node rep separately.  The encoder runs per-cell in forward().
-        At evaluation, per-cell logits are averaged (soft majority vote).
+        One sample per eligible U-path → [4, d_llm] per path.
 
-    include_header_emb=True
-        Also include the column's own header node embedding in the mean-pool.
-        In U-paths, the header of col_idx_a is stored at pivot_a (smp_idx[:,0]);
-        the header of col_idx_b is stored at pivot_b (smp_idx[:,3]).
-        In cell mode the header rep is appended as an extra entry per column.
+    The 4 positions are always in canonical U-path order:
+        [0] pivot_a  — column header of the a-side column
+        [1] node_a   — cell value  of the a-side column  (← this col when smp)
+        [2] node_b   — cell value  of the b-side column  (← this col when smp_bar)
+        [3] pivot_b  — column header of the b-side column
 
     Returns
     -------
-    embs      [N, d_llm]       N = n_cols (column) or n_cells (cell)
+    smp_embs  [N, 4, d_llm]    raw embeddings: [pivot_a, node_a, node_b, pivot_b]
     multi_hot [N, num_classes] float multi-hot label matrix
     col_ids   [N]              int — unique column index each row belongs to
     """
@@ -172,47 +181,58 @@ def extract_column_embeddings(
 
             js_a = rec_col_a_to_js.get((rec_idx, col_idx), [])
             js_b = rec_col_b_to_js.get((rec_idx, col_idx), [])
+
+            # Filter paths by smp_source: each source only uses the paths
+            # where this column plays the correct role.
+            #   smp     → col_a role → js_a only  (node_a at position [1] = this col)
+            #   smp_bar → col_b role → js_b only  (node_b at position [2] = this col)
+            #   both    → all paths
+            if smp_source == "smp":
+                js_b = []
+            elif smp_source == "smp_bar":
+                js_a = []
+            # both: keep js_a and js_b as-is
+
             if not js_a and not js_b:
                 skipped += 1
                 continue
 
-            # Raw LLM embeddings (pre-encoder):
-            # a-side U-paths: this column's cell is node_a → smp_idx[:, 1]
-            # b-side U-paths: this column's cell is node_b → smp_idx[:, 2]
-            # Header node:    pivot_a → smp_idx[:, 0] (a-side) / pivot_b → smp_idx[:, 3] (b-side)
-            reps: list[torch.Tensor] = []
-            if js_a:
-                idx_a = torch.tensor(js_a, dtype=torch.long)
-                reps.append(F.normalize(smp_ds._embed_cache[smp_ds._smp_idx[idx_a, 1]], dim=-1))
-            if js_b:
-                idx_b = torch.tensor(js_b, dtype=torch.long)
-                reps.append(F.normalize(smp_ds._embed_cache[smp_ds._smp_idx[idx_b, 2]], dim=-1))
-            cell_reps = torch.cat(reps, dim=0)  # [n_upaths_for_col, d_llm]
-
-            # Header embedding: take from first available U-path (same text for all)
-            if include_header_emb:
-                if js_a:
-                    hdr_raw = smp_ds._embed_cache[smp_ds._smp_idx[idx_a[0:1], 0]]
-                else:
-                    hdr_raw = smp_ds._embed_cache[smp_ds._smp_idx[idx_b[0:1], 3]]
-                hdr_rep = F.normalize(hdr_raw, dim=-1)  # [1, d_llm]
-
+            # _embed_cache[_smp_idx[j]] → [4, d_llm] for U-path j.
+            # Advanced indexing: _embed_cache[_smp_idx[idx]] → [n, 4, d_llm].
             if embed_mode == "column":
-                col_rep = cell_reps.mean(dim=0)
-                if include_header_emb:
-                    col_rep = torch.stack([col_rep, hdr_rep[0]]).mean(dim=0)
-                embs_list.append(col_rep)
+                # Collect all U-paths for this column (a-side and b-side) then
+                # mean-pool each position independently → [4, d_llm].
+                all_paths: list[torch.Tensor] = []
+                if js_a:
+                    idx_a = torch.tensor(js_a, dtype=torch.long)
+                    all_paths.append(smp_ds._embed_cache[smp_ds._smp_idx[idx_a]])  # [n_a, 4, d]
+                if js_b:
+                    idx_b = torch.tensor(js_b, dtype=torch.long)
+                    all_paths.append(smp_ds._embed_cache[smp_ds._smp_idx[idx_b]])  # [n_b, 4, d]
+                stacked = torch.cat(all_paths, dim=0)              # [n_paths, 4, d_llm]
+                pooled  = F.normalize(stacked.mean(dim=0), dim=-1) # [4, d_llm]
+                embs_list.append(pooled)
                 multi_hot_list.append(hot)
                 col_ids_list.append(col_counter)
-            else:  # cell — one entry per U-path node rep
-                for rep in cell_reps:
-                    embs_list.append(rep)
-                    multi_hot_list.append(hot)
-                    col_ids_list.append(col_counter)
-                if include_header_emb:  # header as an extra cell-level entry
-                    embs_list.append(hdr_rep[0])
-                    multi_hot_list.append(hot)
-                    col_ids_list.append(col_counter)
+            else:  # cell — one [4, d_llm] entry per U-path
+                if js_a:
+                    idx_a  = torch.tensor(js_a, dtype=torch.long)
+                    paths_a = F.normalize(
+                        smp_ds._embed_cache[smp_ds._smp_idx[idx_a]], dim=-1
+                    )  # [n_a, 4, d_llm]
+                    for i in range(paths_a.size(0)):
+                        embs_list.append(paths_a[i])
+                        multi_hot_list.append(hot)
+                        col_ids_list.append(col_counter)
+                if js_b:
+                    idx_b  = torch.tensor(js_b, dtype=torch.long)
+                    paths_b = F.normalize(
+                        smp_ds._embed_cache[smp_ds._smp_idx[idx_b]], dim=-1
+                    )  # [n_b, 4, d_llm]
+                    for i in range(paths_b.size(0)):
+                        embs_list.append(paths_b[i])
+                        multi_hot_list.append(hot)
+                        col_ids_list.append(col_counter)
             col_counter += 1
 
     avg_lpc = sum(h.sum().item() for h in multi_hot_list) / max(col_counter, 1)
@@ -228,8 +248,8 @@ def extract_column_embeddings(
             "U-paths can be generated, (3) data.folder points to the correct dataset."
         )
     return (
-        torch.stack(embs_list),
-        torch.stack(multi_hot_list),
+        torch.stack(embs_list),       # [N, 4, d_llm]
+        torch.stack(multi_hot_list),  # [N, C]
         torch.tensor(col_ids_list, dtype=torch.long),
     )
 
@@ -240,11 +260,22 @@ class CTAClassifier(pl.LightningModule):
     """
     Multi-label, multi-class CTA classifier with optional end-to-end encoder.
 
-    When ``encoder`` is provided the forward pass is:
-        raw_llm_emb  →  input_projection  →  [CLS, proj]  →  transformer_encoder
-        →  CLS output  →  head  →  logits
+    Input to forward(): [B, 4, d_llm] — [pivot_a, node_a, node_b, pivot_b] raw LLM embeddings.
+
+    When ``encoder`` is provided:
+        [B, 4, d_llm]  →  input_projection
+        →  [CLS, pivot_a, node_a, node_b, pivot_b]  (5 tokens)  →  transformer_encoder
+        →  select positions per embed_mode + smp_source  →  head  →  logits
     When ``encoder`` is None:
-        raw_llm_emb  →  head  →  logits
+        select raw LLM positions per embed_mode + smp_source  →  head  →  logits
+
+    Position selection rules (enc_out positions: 0=CLS, 1=pivot_a, 2=node_a, 3=node_b, 4=pivot_b):
+        column + smp      → avg(pivot_a, node_a)                → [B, d]  → head → [B, C]
+        column + smp_bar  → avg(pivot_b, node_b)                → [B, d]  → head → [B, C]
+        column + both     → stack(avg(pa,na), avg(pb,nb))       → [2B, d] → head → [2B, C] → mean → [B, C]
+        cell   + smp      → node_a                              → [B, d]  → head → [B, C]
+        cell   + smp_bar  → node_b                              → [B, d]  → head → [B, C]
+        cell   + both     → stack(node_a, node_b)               → [2B, d] → head → [2B, C] → mean → [B, C]
 
     ``freeze_encoder=True``  : encoder weights are frozen — only the head trains.
     ``freeze_encoder=False`` : encoder trains jointly with the head.
@@ -259,13 +290,14 @@ class CTAClassifier(pl.LightningModule):
     def __init__(
         self,
         embed_dim: int,                      # d_llm: raw LLM embedding size
-        head_dim: int,                       # d_model (encoder out) or embed_dim if no encoder
+        head_dim: int,                       # d_model (encoder out) or d_llm if no encoder
         num_classes: int,
+        embed_mode: str = "column",          # 'column' | 'cell'
+        smp_source: str = "smp",             # 'smp' | 'smp_bar' | 'both'
         intermediate_size: int | None = None,
         lr: float = 3e-4,
         weight_decay: float = 1e-2,
         max_epochs: int = 20,
-        label_smoothing: float = 0.0,
         threshold: float = 0.5,
         # ── encoder ──────────────────────────────────────────────────────────
         encoder: "TableEmbedJePA | None" = None,
@@ -336,20 +368,74 @@ class CTAClassifier(pl.LightningModule):
         }
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # x: expected [B, 4, d_llm]  —  [pivot_a, node_a, node_b, pivot_b]
+        # Backward-compatibility: older extraction code may still yield [B, d_llm].
+        if x.dim() == 2:
+            if not getattr(self, "_warned_legacy_input", False):
+                print(
+                    "[CTA][forward] WARNING: received legacy 2D input [B, d]. "
+                    "Expanding to [B, 4, d] by repetition for compatibility.",
+                    flush=True,
+                )
+                self._warned_legacy_input = True
+            x = x.unsqueeze(1).expand(-1, 4, -1)
+        elif x.dim() == 3 and x.size(1) == 1:
+            if not getattr(self, "_warned_single_token_input", False):
+                print(
+                    "[CTA][forward] WARNING: received single-token input [B, 1, d]. "
+                    "Expanding to [B, 4, d] by repetition for compatibility.",
+                    flush=True,
+                )
+                self._warned_single_token_input = True
+            x = x.expand(-1, 4, -1)
+        elif x.dim() != 3 or x.size(1) != 4:
+            raise ValueError(
+                f"CTAClassifier.forward expected input shape [B, 4, d], got {tuple(x.shape)}"
+            )
+
         if self.encoder is not None:
-            # x: [B, d_llm]  →  treat as a single-token sequence + CLS
-            x = x.unsqueeze(1)                                               # [B, 1, d_llm]
-            proj = self.encoder.input_projection(x)                          # [B, 1, d_model]
+            enc_device = next(self.encoder.transformer_encoder.parameters()).device
+            if x.device != enc_device:
+                x = x.to(enc_device)
+            B = x.size(0)
+            proj = self.encoder.input_projection(x)                     # [B, 4, d_model]
+            cls_tok = self.encoder.cls_token.to(device=x.device, dtype=x.dtype)
             cls  = self.encoder.input_projection(
-                       self.encoder.cls_token                                # [1, 1, d_llm]
-                   ).expand(x.size(0), -1, -1)                               # [B, 1, d_model]
-            seq  = torch.cat([cls, proj], dim=1)                             # [B, 2, d_model]
-            enc_out, _, _ = self.encoder.transformer_encoder(seq)
-            x = enc_out[:, 0, :]                                             # CLS → [B, d_model]
-        return self.head(x)
+                       cls_tok                                           # [1, 1, d_llm]
+                   ).expand(B, -1, -1)                                  # [B, 1, d_model]
+            seq     = torch.cat([cls, proj], dim=1)                     # [B, 5, d_model]
+            enc_out, _, _ = self.encoder.transformer_encoder(seq)       # [B, 5, d_model]
+            # positions: 0=CLS  1=pivot_a  2=node_a  3=node_b  4=pivot_b
+            pa, na = enc_out[:, 1, :], enc_out[:, 2, :]
+            nb, pb = enc_out[:, 3, :], enc_out[:, 4, :]
+        else:
+            pa, na = x[:, 0, :], x[:, 1, :]
+            nb, pb = x[:, 2, :], x[:, 3, :]
+
+        em  = self.hparams.embed_mode
+        src = self.hparams.smp_source
+        if em == "column":
+            if src == "smp":
+                rep = (pa + na) * 0.5                                     # [B, d]
+            elif src == "smp_bar":
+                rep = (pb + nb) * 0.5                                     # [B, d]
+            else:  # both → stack → [2B, d]
+                rep = torch.cat([(pa + na) * 0.5, (pb + nb) * 0.5], dim=0)
+        else:  # cell
+            if src == "smp":
+                rep = na                                                   # [B, d]
+            elif src == "smp_bar":
+                rep = nb                                                   # [B, d]
+            else:  # both → stack → [2B, d]
+                rep = torch.cat([na, nb], dim=0)
+        logits = self.head(rep)                                            # [B, C] or [2B, C]
+        if src == "both":
+            B = x.size(0)
+            logits = logits.view(2, B, -1).mean(dim=0)                    # [B, C]
+        return logits
 
     def _step(self, batch: tuple, split: str) -> torch.Tensor:
-        col_embs, multi_hot = batch          # [B, d], [B, C] float
+        col_embs, multi_hot = batch          # [B, 4, d_llm], [B, C] float
         logits = self(col_embs)              # [B, C]
         loss   = self.bce(logits, multi_hot)
         probs  = torch.sigmoid(logits)       # [B, C]
@@ -379,7 +465,7 @@ class CTAClassifier(pl.LightningModule):
             weight_decay=self.hparams.weight_decay,
         )
         sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=self.hparams.max_epochs, eta_min=1e-6
+            opt, T_max=self.hparams.max_epochs, eta_min=self.hparams.lr
         )
         return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "epoch"}}
 
@@ -402,7 +488,6 @@ def main(cfg: DictConfig) -> float:
     threshold  = float(OmegaConf.select(cfg, "eval.threshold", default=0.5))
     embed_mode         = str(OmegaConf.select(cfg, "classifier.embed_mode",         default="column"))
     smp_source         = str(OmegaConf.select(cfg, "classifier.smp_source",         default="smp"))
-    include_header_emb = bool(OmegaConf.select(cfg, "classifier.include_header_emb", default=False))
     if embed_mode not in ("column", "cell"):
         raise ValueError(f"classifier.embed_mode must be 'column' or 'cell', got {embed_mode!r}")
     if smp_source not in ("smp", "smp_bar", "both"):
@@ -415,6 +500,19 @@ def main(cfg: DictConfig) -> float:
 
     # ── Pretrained encoder (optional) ─────────────────────────────────────────
     pretrained_ckpt = OmegaConf.select(cfg, "finetuning.pretrained_ckpt")
+    pretrain_cfg = cfg  # default: use current config
+    
+    if pretrained_ckpt:
+        # If pretrained_ckpt is a directory, auto-resolve to last.ckpt and load pretrain config
+        ckpt_path = Path(pretrained_ckpt)
+        if ckpt_path.is_dir():
+            pretrain_run_cfg = ckpt_path / "run_config.yaml"
+            if pretrain_run_cfg.exists():
+                pretrain_cfg = OmegaConf.load(str(pretrain_run_cfg))
+                print(f"[CTA][finetune] loaded pretraining config from {pretrain_run_cfg}")
+            pretrained_ckpt = str(ckpt_path / "last.ckpt")
+            print(f"[CTA][finetune] auto-resolved checkpoint folder to {pretrained_ckpt}")
+    
     # ── Encoder setup ──────────────────────────────────────────────────────────
     # freeze_encoder=True  + pretrained_ckpt=null  → NO encoder (raw LLM embs → head)
     # freeze_encoder=False + pretrained_ckpt=null  → random-init encoder, trained jointly
@@ -423,22 +521,22 @@ def main(cfg: DictConfig) -> float:
     freeze_encoder = bool(OmegaConf.select(cfg, "classifier.freeze_encoder", default=False))
     use_encoder    = pretrained_ckpt or not freeze_encoder   # skip only when null+frozen
 
-    _hs = cfg.model.hidden_size
-    _nh = max(1, min(cfg.model.num_heads, _hs // 64))
+    _hs = pretrain_cfg.model.hidden_size
+    _nh = max(1, min(pretrain_cfg.model.num_heads, _hs // 64))
     while _hs % _nh != 0 and _nh > 1:
         _nh -= 1
-    _ablate = bool(OmegaConf.select(cfg, "model.ablate_proj", default=False))
+    _ablate = bool(OmegaConf.select(pretrain_cfg, "model.ablate_proj", default=False))
     _enc_cfg = TableEmbedJePAConfig(
         hidden_size=_hs,
-        num_hidden_layers=cfg.model.num_layers,
+        num_hidden_layers=pretrain_cfg.model.num_layers,
         num_attention_heads=_nh,
-        intermediate_size=cfg.model.intermediate_size or (_hs * 4),
-        attention_probs_dropout_prob=cfg.model.attention_dropout,
-        hidden_dropout_prob=cfg.model.hidden_dropout,
-        layer_norm_eps=cfg.model.layer_norm_eps,
+        intermediate_size=pretrain_cfg.model.intermediate_size or (_hs * 4),
+        attention_probs_dropout_prob=pretrain_cfg.model.attention_dropout,
+        hidden_dropout_prob=pretrain_cfg.model.hidden_dropout,
+        layer_norm_eps=pretrain_cfg.model.layer_norm_eps,
         embedding_dim=int(cfg.embedder.embed_dim),
-        tempeture=cfg.model.temperature,
-        beta=cfg.model.beta,
+        tempeture=pretrain_cfg.model.temperature,
+        beta=pretrain_cfg.model.beta,
     )
 
     encoder: "TableEmbedJePA | None" = None
@@ -456,12 +554,10 @@ def main(cfg: DictConfig) -> float:
             encoder.eval()
 
     # ── Build per-split TensorDatasets ────────────────────────────────────────
-    # +1 because max_rows_* is user-facing as "data rows" but the header row
-    # is stored separately — adding 1 ensures the user's count is fully honoured.
     _MAX_ROWS = {
-        "train": (cfg.data.get("max_rows_train") + 1) if cfg.data.get("max_rows_train") is not None else None,
-        "dev":   (cfg.data.get("max_rows_dev")   + 1) if cfg.data.get("max_rows_dev")   is not None else None,
-        "test":  (cfg.data.get("max_rows_test")  + 1) if cfg.data.get("max_rows_test")  is not None else None,
+        "train": cfg.data.get("max_rows_train"),
+        "dev":   cfg.data.get("max_rows_dev"),
+        "test":  cfg.data.get("max_rows_test"),
     }
 
     def _make_smp_ds(data_path: str, split: str) -> CTASMPDataset:
@@ -482,6 +578,7 @@ def main(cfg: DictConfig) -> float:
             embed_cache_dir=cfg.embedder.get("embed_cache_dir"),
             cat_qry_template=cfg.query.cat_qry_template,
             cat_qry_bar_template=cfg.query.cat_qry_bar_template,
+            expected_embed_dim=int(cfg.embedder.embed_dim) if cfg.embedder.get("embed_dim") else None,
         )
 
     def _load_col_types(data_path: str) -> dict[str, list[list[str]]]:
@@ -502,18 +599,18 @@ def main(cfg: DictConfig) -> float:
         embs, multi_hot, col_ids = extract_column_embeddings(
             smp_ds, type2idx, col_types,
             embed_mode=embed_mode,
-            include_header_emb=include_header_emb,
+            smp_source=smp_source,
         )
         splits[split]   = TensorDataset(embs, multi_hot)
         col_ids_map[split] = col_ids
         n_cols = int(col_ids.max().item()) + 1 if len(col_ids) else 0
         print(
             f"[CTA][finetune][{split}] {n_cols} columns  {len(embs)} samples "
-            f"d={embs.shape[1]}  num_classes={num_classes}  embed_mode={embed_mode}"
+            f"d={embs.shape[2]}  num_classes={num_classes}  embed_mode={embed_mode}"
         )
 
-    # embed_dim = d_llm (raw LLM); head_dim = d_model (encoder output) or d_llm if no encoder
-    embed_dim = splits["train"].tensors[0].shape[1]
+    # embed_dim = d_llm; head_dim = d_model (or d_llm if no encoder)
+    embed_dim = splits["train"].tensors[0].shape[2]  # [N, 4, d_llm]
     head_dim  = cfg.model.hidden_size if encoder is not None else embed_dim
 
     # Encoder config dict saved into hparams so CTAClassifier.load_from_checkpoint
@@ -548,11 +645,12 @@ def main(cfg: DictConfig) -> float:
         embed_dim=embed_dim,
         head_dim=head_dim,
         num_classes=num_classes,
+        embed_mode=embed_mode,
+        smp_source=smp_source,
         intermediate_size=OmegaConf.select(cfg, "classifier.intermediate_size") or None,
         lr=cfg.finetuning.lr,
         weight_decay=cfg.finetuning.weight_decay,
         max_epochs=cfg.finetuning.epochs,
-        label_smoothing=cfg.finetuning.label_smoothing,
         threshold=threshold,
         encoder=encoder,
         encoder_config_dict=encoder_config_dict,
@@ -564,13 +662,38 @@ def main(cfg: DictConfig) -> float:
     )
     print(
         f"[CTA][finetune] embed_dim={embed_dim}→head_dim={head_dim}  num_classes={num_classes}"
-        f"  embed_mode={embed_mode}  include_header_emb={include_header_emb}"
+        f"  embed_mode={embed_mode}  smp_source={smp_source}"
         f"  encoder={enc_mode_str}  threshold={threshold}"
     )
 
+    # ── Output directories: base / model_slug / timestamp_cfghash ───────────
+    _model_slug = (
+        cfg.embedder.model_name.split("/")[-1]
+        .replace(" ", "_").replace(":", "#")
+    )
+    _run_ts   = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    _cfg_hash = hashlib.md5(OmegaConf.to_yaml(cfg).encode()).hexdigest()[:8]
+    _run_suffix = Path(_model_slug) / f"{_run_ts}_{_cfg_hash}"
+
     # ── Callbacks ─────────────────────────────────────────────────────────────
-    out_dir = Path(cfg.finetuning.output_dir)
+    out_dir  = Path(cfg.finetuning.output_dir) / _run_suffix
+    eval_dir = Path(cfg.eval.output_dir)        / _run_suffix
     out_dir.mkdir(parents=True, exist_ok=True)
+    eval_dir.mkdir(parents=True, exist_ok=True)
+    with open_dict(cfg):
+        _saved_cfg = OmegaConf.merge(cfg, OmegaConf.create({
+            "_run": {
+                "slug":    _model_slug,
+                "ts":      _run_ts,
+                "hash":    _cfg_hash,
+                "out_dir": str(out_dir),
+                "eval_dir": str(eval_dir),
+            }
+        }))
+    OmegaConf.save(_saved_cfg, str(out_dir / "run_config.yaml"))
+    print(f"[CTA][finetune] embedder slug  : {_model_slug}")
+    print(f"[CTA][finetune] checkpoint dir : {out_dir}")
+    print(f"[CTA][finetune] eval dir       : {eval_dir}")
 
     callbacks = [
         ModelCheckpoint(
@@ -616,12 +739,19 @@ def main(cfg: DictConfig) -> float:
     )
 
     # ── Offline evaluation on best checkpoint ─────────────────────────────────
-    eval_dir = Path(cfg.eval.output_dir)
-    eval_dir.mkdir(parents=True, exist_ok=True)
+
 
     best_ckpt  = callbacks[0].best_model_path or str(out_dir / "last.ckpt")
     best_model = CTAClassifier.load_from_checkpoint(best_ckpt)
     best_model.eval().to(device)
+
+    # Run test through the trainer so metrics appear in TensorBoard
+    trainer.test(model=best_model, dataloaders=_loader("test", shuffle=False))
+
+    # Defensive re-sync: trainer.test may alter module placement/lifecycle.
+    best_model = best_model.to(device)
+    best_model.eval()
+    eval_device = next(best_model.parameters()).device
 
     metrics: dict = {}
 
@@ -630,7 +760,7 @@ def main(cfg: DictConfig) -> float:
         col_ids = col_ids_map[split]
 
         with torch.no_grad():
-            logits = best_model(embs.to(device)).cpu()
+            logits = best_model(embs.to(eval_device)).cpu()
 
         # Soft majority voting in cell mode: average per-cell logits → column logit
         if embed_mode == "cell":

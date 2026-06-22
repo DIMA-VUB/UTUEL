@@ -24,5 +24,6 @@ CTA/checkpoints/**
 CTA/lightning_logs/**
 CTA/outputs/**
 CTA/CTA/**
+CTA/diagrams/**
 CTA/multirun/**
 CTA/optuna.db

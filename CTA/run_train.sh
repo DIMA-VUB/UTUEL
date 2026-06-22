@@ -62,13 +62,15 @@ done
 
 # ── Build common Hydra overrides ──────────────────────────────────────────────
 SLUG="${MODEL_NAME//\//_}"
+# NOTE: do NOT include the slug in these base dirs.
+# pretrain.py and finetune.py append  <slug>/<timestamp>_<cfghash>  automatically.
 OVERRIDES=(
     "embedder.model_type=${MODEL_TYPE}"
     "embedder.model_name=${MODEL_NAME}"
     "embedder.embed_dim=${EMBED_DIM}"
-    "pretraining.output_dir=CTA/checkpoints/${SLUG}/pretrain"
-    "finetuning.output_dir=CTA/checkpoints/${SLUG}/finetune"
-    "eval.output_dir=CTA/outputs/${SLUG}"
+    "pretraining.output_dir=CTA/checkpoints/pretrain"
+    "finetuning.output_dir=CTA/checkpoints/finetune"
+    "eval.output_dir=CTA/outputs"
 )
 if [[ -n "${EXTRA}" ]]; then
     read -ra EXTRA_ARRAY <<< "${EXTRA}"
@@ -104,7 +106,14 @@ case "${STAGE}" in
     both)
         echo "=== [CTA] Stage 1/2: pretrain ==="
         run_python "CTA/pretrain.py" false
-        PRETRAIN_CKPT="CTA/checkpoints/${SLUG}/pretrain/last.ckpt"
+        # Discover the most recent checkpoint written by pretrain.py.
+        # Python writes to:  CTA/checkpoints/pretrain/<slug>/<ts>_<hash>/last.ckpt
+        PT_BASE="CTA/checkpoints/pretrain/${SLUG}"
+        PRETRAIN_CKPT=$(ls -t "${PT_BASE}"/*/last.ckpt 2>/dev/null | head -1)
+        if [[ -z "${PRETRAIN_CKPT}" ]]; then
+            echo "[ERROR] No pretrain checkpoint found under ${PT_BASE}/"
+            exit 1
+        fi
         echo "=== [CTA] Stage 2/2: finetune (from ${PRETRAIN_CKPT}) ==="
         OVERRIDES+=("finetuning.pretrained_ckpt=${PRETRAIN_CKPT}")
         OVERRIDES_STR="${OVERRIDES[*]}"

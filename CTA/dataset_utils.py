@@ -105,5 +105,5 @@ def get_embedder(
     from langchain_ollama import OllamaEmbeddings
     return OllamaEmbeddings(
         base_url=base_url or "http://localhost:11434/",
-        model=tag,
+        model=model_name,
     )

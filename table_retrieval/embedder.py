@@ -19,6 +19,7 @@ Public API
 
 from __future__ import annotations
 
+import logging
 import sys
 from pathlib import Path
 from typing import Optional
@@ -26,6 +27,9 @@ from typing import Optional
 import numpy as np
 
 from abstract import TableRetrieverBase, EMBEDDER_REGISTRY  # type: ignore[import]
+
+# Suppress verbose httpx logging from LangChain OllamaEmbeddings
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
 
 # ── HuggingFace (sentence-transformers) ──────────────────────────────────────

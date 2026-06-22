@@ -27,13 +27,16 @@ be loaded by finetune.py via finetuning.pretrained_ckpt.
 
 from __future__ import annotations
 
+import datetime
+import hashlib
 import sys
+import time
 from pathlib import Path
 
 import hydra
 import pytorch_lightning as pl
 import torch
-from omegaconf import DictConfig, OmegaConf
+from omegaconf import DictConfig, OmegaConf, open_dict
 from pytorch_lightning.callbacks import (
     EarlyStopping,
     LearningRateMonitor,
@@ -138,8 +141,14 @@ def main(cfg: DictConfig) -> float:
     print(OmegaConf.to_yaml(cfg))
 
     # ── Data ──────────────────────────────────────────────────────────────────
+    t_setup = time.perf_counter()
+    print("[CTA][pretrain] starting datamodule setup …", flush=True)
     dm = CTASMPDataModule(cfg)
     dm.setup("fit")
+    print(
+        f"[CTA][pretrain] datamodule setup finished in {time.perf_counter() - t_setup:.1f}s",
+        flush=True,
+    )
 
     # ── Model ─────────────────────────────────────────────────────────────────
     model = build_model(cfg, embed_dim_in=dm.embed_dim)
@@ -151,9 +160,27 @@ def main(cfg: DictConfig) -> float:
         f"  hidden_size={cfg.model.hidden_size}"
     )
 
-    # ── Callbacks ─────────────────────────────────────────────────────────────
-    out_dir = Path(cfg.pretraining.output_dir)
+    # ── Output directory: base / model_slug / timestamp_cfghash ─────────────
+    _model_slug = (
+        cfg.embedder.model_name.split("/")[-1]
+        .replace(" ", "_").replace(":", "#")
+    )
+    _run_ts   = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    _cfg_hash = hashlib.md5(OmegaConf.to_yaml(cfg).encode()).hexdigest()[:8]
+    out_dir = Path(cfg.pretraining.output_dir) / _model_slug / f"{_run_ts}_{_cfg_hash}"
     out_dir.mkdir(parents=True, exist_ok=True)
+    with open_dict(cfg):
+        _saved_cfg = OmegaConf.merge(cfg, OmegaConf.create({
+            "_run": {
+                "slug":    _model_slug,
+                "ts":      _run_ts,
+                "hash":    _cfg_hash,
+                "out_dir": str(out_dir),
+            }
+        }))
+    OmegaConf.save(_saved_cfg, str(out_dir / "run_config.yaml"))
+    print(f"[CTA][pretrain] embedder slug  : {_model_slug}")
+    print(f"[CTA][pretrain] checkpoint dir : {out_dir}")
 
     callbacks = [
         ModelCheckpoint(
@@ -191,6 +218,7 @@ def main(cfg: DictConfig) -> float:
         default_root_dir=str(out_dir),
     )
 
+    print("[CTA][pretrain] starting trainer.fit …", flush=True)
     trainer.fit(
         model,
         datamodule=dm,

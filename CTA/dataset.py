@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional, Union
@@ -61,7 +62,12 @@ _TRL  = _HERE.parent / "TRL-model"
 if str(_TRL) not in sys.path:
     sys.path.insert(0, str(_TRL))
 
+_TRR = _HERE.parent / "table_retrieval"
+if str(_TRR) not in sys.path:
+    sys.path.insert(0, str(_TRR))
+
 from smp import UPath, generate_u_paths_flat, generate_u_paths_from_graph  # noqa: E402
+from embedder import OllamaEmbedder  # type: ignore[import]  # noqa: E402
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -97,6 +103,7 @@ class CTADataset(Dataset):
         embed_batch_size: int = 64,
         cache_embeddings: bool = True,
         embed_cache_dir: Optional[Union[str, Path]] = None,
+        expected_embed_dim: Optional[int] = None,  # if set, cached dim is validated
     ) -> None:
         self.type2idx, self.idx2type = load_type_vocab(type_vocab_path)
         self.num_classes = len(self.type2idx)
@@ -104,11 +111,9 @@ class CTADataset(Dataset):
         self.items: list[dict] = []
         data_path = Path(data_path)
         records = json.loads(data_path.read_text(encoding="utf-8"))
-        if max_rows is not None:
-            records = records[:max_rows]
 
         for rec in records:
-            self._parse_record(rec, use_node_a, use_node_b, max_cells_per_col)
+            self._parse_record(rec, use_node_a, use_node_b, max_cells_per_col, max_rows)
 
         print(
             f"[CTA][dataset] {len(self.items)} (table, col) samples "
@@ -123,43 +128,86 @@ class CTADataset(Dataset):
 
         self._cache_path: Optional[Path] = None
         if cache_embeddings:
-            cache_dir = Path(embed_cache_dir) if embed_cache_dir else data_path.parent
+            # Each model gets its own subdirectory so caches never collide.
+            # Subdirectory name = last component of model_name, same sanitisation
+            # as the run slug used by pretrain.py/finetune.py:
+            #   sentence-transformers/all-MiniLM-L6-v2  →  all-MiniLM-L6-v2
+            #   qwen3-embedding:0.6b                    →  qwen3-embedding#0.6b
+            _model_slug = (model_name or model_type).split("/")[-1] \
+                            .replace(":", "#").replace(" ", "_")
+            base_cache_dir = Path(embed_cache_dir) if embed_cache_dir else data_path.parent
+            cache_dir = base_cache_dir / _model_slug
             cache_dir.mkdir(parents=True, exist_ok=True)
-            slug = f"{model_type}_{(model_name or '').replace('/', '_')}_{data_path.stem}"
-            self._cache_path = cache_dir / f"{slug}.embed_cache.pt"
+            self._cache_path = cache_dir / f"{data_path.stem}.embed_cache.pt"
+            print(f"[CTA][embed] cache path: {self._cache_path}")
 
         self.embed_cache: dict[str, torch.Tensor] = {}
         if self._cache_path is not None and self._cache_path.exists():
-            self.embed_cache = torch.load(self._cache_path, weights_only=True)
-            print(f"[CTA][embed] loaded cache from {self._cache_path}")
-            missing = [t for t in unique_texts if t not in self.embed_cache]
+            _loaded = torch.load(self._cache_path, weights_only=True)
+            # Validate embedding dimension against what the config requests.
+            # If there is a mismatch the cache was produced by a different model
+            # and must be regenerated rather than silently used.
+            _cached_dim = next(iter(_loaded.values())).shape[0] if _loaded else None
+            if expected_embed_dim is not None and _cached_dim is not None \
+                    and _cached_dim != expected_embed_dim:
+                print(
+                    f"[CTA][embed] WARNING: cached dim={_cached_dim} "
+                    f"!= expected dim={expected_embed_dim}. "
+                    f"Deleting stale cache and regenerating: {self._cache_path}"
+                )
+                self._cache_path.unlink(missing_ok=True)
+                missing = unique_texts
+            else:
+                self.embed_cache = _loaded
+                print(f"[CTA][embed] loaded cache from {self._cache_path} (dim={_cached_dim})")
+                missing = [t for t in unique_texts if t not in self.embed_cache]
         else:
             missing = unique_texts
 
         self._embedder = None
         if missing and precompute:
-            self._embedder = get_embedder(
-                model_type=model_type,
-                base_url=base_url,
-                model_name=model_name,
-                api_key=api_key,
-            )
+            if model_type.strip().lower() == "ollama":
+                self._embedder = OllamaEmbedder(
+                    base_url=base_url or "http://localhost:11434/",
+                    model_name=model_name or "",
+                    batch_size=embed_batch_size,
+                )
+            else:
+                self._embedder = get_embedder(
+                    model_type=model_type,
+                    base_url=base_url,
+                    model_name=model_name,
+                    api_key=api_key,
+                )
             print(f"[CTA][embed] embedding {len(missing)} unique texts …")
-            for i in range(0, len(missing), embed_batch_size):
-                batch = missing[i : i + embed_batch_size]
-                vecs = self._embedder.embed_documents(batch)
-                for txt, vec in zip(batch, vecs):
-                    self.embed_cache[txt] = torch.tensor(vec, dtype=torch.float32)
+            if hasattr(self._embedder, "encode_documents"):
+                vecs = self._embedder.encode_documents(missing)
+            else:
+                vecs = self._embedder.embed_documents(missing)
+            for txt, vec in zip(missing, vecs):
+                t = torch.tensor(vec, dtype=torch.float32)
+                if expected_embed_dim is not None and t.shape[0] > expected_embed_dim:
+                    t = t[:expected_embed_dim]
+                self.embed_cache[txt] = t
             if self._cache_path is not None:
+                # Log actual stored dim so mismatches are visible
+                _stored_dim = next(iter(self.embed_cache.values())).shape[0]
                 torch.save(self.embed_cache, self._cache_path)
-                print(f"[CTA][embed] saved cache → {self._cache_path}")
+                print(f"[CTA][embed] saved cache → {self._cache_path}  (dim={_stored_dim})")
         elif not missing and precompute:
-            self._embedder = get_embedder(
-                model_type=model_type,
-                base_url=base_url,
-                model_name=model_name,
-                api_key=api_key,
-            )
+            if model_type.strip().lower() == "ollama":
+                self._embedder = OllamaEmbedder(
+                    base_url=base_url or "http://localhost:11434/",
+                    model_name=model_name or "",
+                    batch_size=embed_batch_size,
+                )
+            else:
+                self._embedder = get_embedder(
+                    model_type=model_type,
+                    base_url=base_url,
+                    model_name=model_name,
+                    api_key=api_key,
+                )
 
         # Detect embed_dim from cache
         if self.embed_cache:
@@ -167,14 +215,13 @@ class CTADataset(Dataset):
         else:
             self.embed_dim = 384
 
-    # ── Record parser ─────────────────────────────────────────────────────────
-
     def _parse_record(
         self,
         rec: list,
         use_node_a: bool,
         use_node_b: bool,
         max_cells: Optional[int],
+        max_rows: Optional[int],
     ) -> None:
         """
         Parse one .table_col_type record and append (table, col) items.
@@ -201,6 +248,8 @@ class CTADataset(Dataset):
         for col_partition in cell_links:
             for entry in col_partition:
                 (row_idx, col_idx), (entity_id, entity_label) = entry
+                if max_rows is not None and row_idx >= max_rows:
+                    continue
                 col_to_cells.setdefault(col_idx, []).append(str(entity_label))
 
         # Process type labels per column (rec[7] is a list of per-column type lists)
@@ -213,22 +262,7 @@ class CTADataset(Dataset):
                 continue
             label = self.type2idx[primary_type]
 
-            # Collect cell texts for this column
-            texts: list[str] = []
-            if use_node_a and col_idx in col_to_cells:
-                texts.extend(col_to_cells[col_idx])
-            if use_node_b:
-                # Collect cell texts from all other columns in the same rows
-                # as a complementary context signal (node_b side)
-                for other_col, cell_texts in col_to_cells.items():
-                    if other_col != col_idx:
-                        texts.extend(cell_texts)
-
-            if not texts:
-                # Fall back to column header if no cell texts are available
-                header = headers[col_idx] if col_idx < len(headers) else f"col_{col_idx}"
-                texts = [header]
-
+            texts = col_to_cells.get(col_idx, [])
             if max_cells is not None:
                 texts = texts[:max_cells]
 
@@ -341,7 +375,7 @@ class CTADataModule(pl.LightningDataModule):
             base_url=cfg.embedder.get("base_url"),
             model_name=cfg.embedder.get("model_name"),
             api_key=cfg.embedder.get("api_key"),
-            max_rows=cfg.data.get("max_rows"),
+            max_rows=cfg.data.get(f"max_rows_{split_tag}"),
             max_cells_per_col=cfg.data.get("max_cells_per_col"),
             use_node_a=cfg.data.use_node_a,
             use_node_b=cfg.data.use_node_b,
@@ -487,6 +521,7 @@ class CTASMPDataset(Dataset):
         embed_cache_dir: Optional[Union[str, Path]] = None,
         cat_qry_template: str = "{pivot_b} ... {pivot_a}({node_a})?",
         cat_qry_bar_template: str = "{pivot_a} ... {pivot_b}({node_b})?",
+        expected_embed_dim: Optional[int] = None,
     ) -> None:
         data_path = Path(data_path)
         self._model_type   = model_type
@@ -495,6 +530,23 @@ class CTASMPDataset(Dataset):
         self._api_key      = api_key
         self._cat_qry_tmpl     = cat_qry_template
         self._cat_qry_bar_tmpl = cat_qry_bar_template
+        _tag = model_type.strip().lower()
+        # Use the table_retrieval OllamaEmbedder directly so CTA reuses the
+        # same class and its document/query methods without reimplementation.
+        if _tag == "ollama":
+            self._embedder = OllamaEmbedder(
+                base_url=base_url or "http://localhost:11434/",
+                model_name=model_name or "",
+                batch_size=embed_batch_size,
+            )
+        else:
+            # Preserve compatibility for backends not covered by table_retrieval.
+            self._embedder = get_embedder(
+                model_type=model_type,
+                base_url=base_url,
+                model_name=model_name,
+                api_key=api_key,
+            )
 
         # ── Load and reconstruct tables ───────────────────────────────────────
         raw_records: list = json.loads(data_path.read_text(encoding="utf-8"))
@@ -542,57 +594,20 @@ class CTASMPDataset(Dataset):
 
         if precompute:
             self._precompute(
-                embed_batch_size,
                 cache_embeddings,
                 embed_cache_dir,
                 data_path,
+                expected_embed_dim,
             )
 
     # ── Embedding ─────────────────────────────────────────────────────────────
 
-    def _embed_batch(self, texts: list[str], batch_size: int) -> torch.Tensor:
-        """Embed texts in chunks via sentence-transformers (local HF) or Ollama."""
-        tag = self._model_type.strip().lower()
-        model_name = self._model_name or "sentence-transformers/all-MiniLM-L6-v2"
-
-        if tag == "huggingface":
-            from sentence_transformers import SentenceTransformer
-            if not hasattr(self, "_st_model"):
-                self._st_model = SentenceTransformer(model_name)
-            vecs = self._st_model.encode(texts, batch_size=batch_size, show_progress_bar=True)
-            t = torch.tensor(vecs, dtype=torch.float32)
-            self._embed_dim = t.shape[1]
-            return t
-
-        # Ollama / OpenAI — chunked HTTP
-        import requests
-        all_vecs: list = []
-        for i in range(0, len(texts), batch_size):
-            chunk = texts[i : i + batch_size]
-            if tag == "openai":
-                from langchain_openai import OpenAIEmbeddings
-                emb = OpenAIEmbeddings(api_key=self._api_key)
-                all_vecs.extend(emb.embed_documents(chunk))
-            else:
-                resp = requests.post(
-                    f"{self._base_url}/api/embed",
-                    json={"model": tag, "input": chunk},
-                    timeout=120,
-                )
-                resp.raise_for_status()
-                all_vecs.extend(resp.json()["embeddings"])
-            print(f"\r[SMP][embed] {min(i+batch_size, len(texts))}/{len(texts)}", end="")
-        print()
-        t = torch.tensor(all_vecs, dtype=torch.float32)
-        self._embed_dim = t.shape[1]
-        return t
-
     def _precompute(
         self,
-        batch_size: int,
         cache_embeddings: bool,
         embed_cache_dir: Optional[Union[str, Path]],
         data_path: Path,
+        expected_embed_dim: Optional[int] = None,
     ) -> None:
         slug = (
             f"{data_path.stem}_"
@@ -601,87 +616,128 @@ class CTASMPDataset(Dataset):
         cache_dir = Path(embed_cache_dir) if embed_cache_dir else data_path.parent
         cache_dir.mkdir(parents=True, exist_ok=True)
         cache_file = cache_dir / f"{slug}_smp.embed_cache.pt"
+        print(
+            f"[CTA][SMP][cache] file={cache_file} "
+            f"enabled={cache_embeddings} samples={len(self._samples)}",
+            flush=True,
+        )
 
         if cache_embeddings and cache_file.exists():
-            ckpt = torch.load(cache_file, map_location="cpu", weights_only=False)
-            _ec   = ckpt.get("embed_cache")
-            _ti   = ckpt.get("text_to_idx")
-            _si   = ckpt.get("smp_idx")
-            _qi   = ckpt.get("qry_cat_idx")
-            _qbi  = ckpt.get("qry_bar_cat_idx")
-            n_emb = _ec.shape[0] if _ec is not None else 0
-            _cache_valid = (
-                _ec is not None and _si is not None
-                and _qi is not None and _qbi is not None
-                and _si.shape[0] == len(self._samples)
-                and int(_si.max()) < n_emb
-                and int(_qi.max()) < n_emb
-                and int(_qbi.max()) < n_emb
-            )
-            if _cache_valid:
-                self._embed_cache     = _ec
-                self._text_to_idx     = _ti
-                self._smp_idx         = _si
-                self._qry_cat_idx     = _qi
-                self._qry_bar_cat_idx = _qbi
-                self._embed_dim       = int(self._embed_cache.shape[1])
-                print(f"[CTA][SMP][cache] loaded {cache_file.name}  dim={self._embed_dim}")
-                return
-            else:
-                print(f"[CTA][SMP][cache] stale/invalid cache {cache_file.name} — recomputing")
+            ckpt = torch.load(cache_file, map_location="cpu")
+            self._doc_embed_cache = ckpt.get("doc_embed_cache", ckpt.get("embed_cache"))
+            self._qry_embed_cache = ckpt.get("qry_embed_cache")
+            self._doc_text_to_idx = ckpt.get("doc_text_to_idx", ckpt.get("text_to_idx", {}))
+            self._qry_text_to_idx = ckpt.get("qry_text_to_idx", {})
+            self._smp_idx = ckpt.get("smp_idx")
+            self._qry_cat_idx = ckpt.get("qry_cat_idx")
+            self._qry_bar_cat_idx = ckpt.get("qry_bar_cat_idx")
 
-        # Collect unique texts
-        text_to_idx: dict[str, int] = {}
+            if self._qry_embed_cache is None and self._doc_embed_cache is not None:
+                self._qry_embed_cache = self._doc_embed_cache
+
+            if self._doc_embed_cache is not None:
+                self._embed_cache = self._doc_embed_cache
+                self._embed_dim = int(self._doc_embed_cache.shape[1])
+                if expected_embed_dim is not None and self._embed_cache.shape[1] > expected_embed_dim:
+                    self._doc_embed_cache = self._doc_embed_cache[:, :expected_embed_dim]
+                    self._qry_embed_cache = self._qry_embed_cache[:, :expected_embed_dim]
+                    self._embed_cache = self._doc_embed_cache
+                    self._embed_dim = expected_embed_dim
+                self._text_to_idx = self._doc_text_to_idx
+                print(
+                    f"[CTA][SMP][cache] loaded {cache_file.name} "
+                    f"doc_texts={len(self._doc_text_to_idx)} qry_texts={len(self._qry_text_to_idx)}",
+                    flush=True,
+                )
+                return
+
+        doc_text_to_idx: dict[str, int] = {}
+        query_text_to_idx: dict[str, int] = {}
+
         for _, up in self._samples:
             for txt in (up.col_header_a, up.cell_value_a, up.cell_value_b, up.col_header_b):
-                if txt not in text_to_idx:
-                    text_to_idx[txt] = len(text_to_idx)
+                if txt not in doc_text_to_idx:
+                    doc_text_to_idx[txt] = len(doc_text_to_idx)
             fmt = dict(
                 pivot_a=up.col_header_a, node_a=up.cell_value_a,
-                node_b=up.cell_value_b,  pivot_b=up.col_header_b,
+                node_b=up.cell_value_b, pivot_b=up.col_header_b,
             )
-            for t in (self._cat_qry_tmpl.format(**fmt), self._cat_qry_bar_tmpl.format(**fmt)):
-                if t not in text_to_idx:
-                    text_to_idx[t] = len(text_to_idx)
+            for txt in (self._cat_qry_tmpl.format(**fmt), self._cat_qry_bar_tmpl.format(**fmt)):
+                if txt not in query_text_to_idx:
+                    query_text_to_idx[txt] = len(query_text_to_idx)
 
-        ordered = [""] * len(text_to_idx)
-        for txt, i in text_to_idx.items():
-            ordered[i] = txt
+        ordered_doc = [""] * len(doc_text_to_idx)
+        for txt, i in doc_text_to_idx.items():
+            ordered_doc[i] = txt
 
-        print(f"[CTA][SMP][embed] {len(ordered)} unique texts …")
-        self._embed_cache = self._embed_batch(ordered, batch_size)
-        self._text_to_idx = text_to_idx
+        ordered_query = [""] * len(query_text_to_idx)
+        for txt, i in query_text_to_idx.items():
+            ordered_query[i] = txt
 
-        # Build fast index tensors
+        print(
+            f"[CTA][SMP][embed] {len(ordered_doc)} unique documents + {len(ordered_query)} unique queries …",
+            flush=True,
+        )
+        if hasattr(self._embedder, "encode_documents"):
+            self._doc_embed_cache = torch.tensor(self._embedder.encode_documents(ordered_doc), dtype=torch.float32)
+        else:
+            self._doc_embed_cache = torch.tensor(self._embedder.embed_documents(ordered_doc), dtype=torch.float32)
+
+        if hasattr(self._embedder, "encode_queries"):
+            qry_vecs = self._embedder.encode_queries(ordered_query)
+        elif hasattr(self._embedder, "embed_query"):
+            qry_vecs = [self._embedder.embed_query(t) for t in ordered_query]
+        else:
+            qry_vecs = self._embedder.embed_documents(ordered_query)
+        self._qry_embed_cache = torch.tensor(qry_vecs, dtype=torch.float32)
+
+        self._embed_dim = int(self._doc_embed_cache.shape[1])
+
+        if expected_embed_dim is not None and self._doc_embed_cache.shape[1] > expected_embed_dim:
+            self._doc_embed_cache = self._doc_embed_cache[:, :expected_embed_dim]
+            self._qry_embed_cache = self._qry_embed_cache[:, :expected_embed_dim]
+            self._embed_dim = expected_embed_dim
+
+        self._doc_text_to_idx = doc_text_to_idx
+        self._qry_text_to_idx = query_text_to_idx
+        self._embed_cache = self._doc_embed_cache
+        self._text_to_idx = self._doc_text_to_idx
+
         smp_rows, qry_rows, qry_bar_rows = [], [], []
         for _, up in self._samples:
             smp_rows.append([
-                text_to_idx[up.col_header_a],
-                text_to_idx[up.cell_value_a],
-                text_to_idx[up.cell_value_b],
-                text_to_idx[up.col_header_b],
+                doc_text_to_idx[up.col_header_a],
+                doc_text_to_idx[up.cell_value_a],
+                doc_text_to_idx[up.cell_value_b],
+                doc_text_to_idx[up.col_header_b],
             ])
             fmt = dict(
                 pivot_a=up.col_header_a, node_a=up.cell_value_a,
-                node_b=up.cell_value_b,  pivot_b=up.col_header_b,
+                node_b=up.cell_value_b, pivot_b=up.col_header_b,
             )
-            qry_rows.append(text_to_idx[self._cat_qry_tmpl.format(**fmt)])
-            qry_bar_rows.append(text_to_idx[self._cat_qry_bar_tmpl.format(**fmt)])
+            qry_rows.append(query_text_to_idx[self._cat_qry_tmpl.format(**fmt)])
+            qry_bar_rows.append(query_text_to_idx[self._cat_qry_bar_tmpl.format(**fmt)])
 
-        self._smp_idx         = torch.tensor(smp_rows,    dtype=torch.long)
-        self._qry_cat_idx     = torch.tensor(qry_rows,    dtype=torch.long)
+        self._smp_idx = torch.tensor(smp_rows, dtype=torch.long)
+        self._qry_cat_idx = torch.tensor(qry_rows, dtype=torch.long)
         self._qry_bar_cat_idx = torch.tensor(qry_bar_rows, dtype=torch.long)
 
         if cache_embeddings:
             torch.save({
-                "embed_cache":     self._embed_cache,
-                "text_to_idx":     self._text_to_idx,
-                "smp_idx":         self._smp_idx,
-                "qry_cat_idx":     self._qry_cat_idx,
+                "doc_embed_cache": self._doc_embed_cache,
+                "qry_embed_cache": self._qry_embed_cache,
+                "doc_text_to_idx": self._doc_text_to_idx,
+                "qry_text_to_idx": self._qry_text_to_idx,
+                "smp_idx": self._smp_idx,
+                "qry_cat_idx": self._qry_cat_idx,
                 "qry_bar_cat_idx": self._qry_bar_cat_idx,
+                "embed_dim": int(self._doc_embed_cache.shape[1]),
             }, cache_file)
-            print(f"[CTA][SMP][cache] saved {cache_file.name}  "
-                  f"({cache_file.stat().st_size / 1024**2:.1f} MB)")
+            print(
+                f"[CTA][SMP][cache] saved {cache_file.name}  "
+                f"({cache_file.stat().st_size / 1024**2:.1f} MB)",
+                flush=True,
+            )
 
     # ── Pickle support (spawn multiprocessing) ────────────────────────────────
 
@@ -711,9 +767,9 @@ class CTASMPDataset(Dataset):
         rec_idx, up = self._samples[idx]
 
         if self._smp_idx is not None:
-            smp_embeds       = self._embed_cache[self._smp_idx[idx]]                      # [4, d]
-            query_embeds     = self._embed_cache[self._qry_cat_idx[idx]].unsqueeze(0)     # [1, d]
-            query_bar_embeds = self._embed_cache[self._qry_bar_cat_idx[idx]].unsqueeze(0) # [1, d]
+            smp_embeds = self._doc_embed_cache[self._smp_idx[idx]]  # [4, d]
+            query_embeds = self._qry_embed_cache[self._qry_cat_idx[idx]].unsqueeze(0)  # [1, d]
+            query_bar_embeds = self._qry_embed_cache[self._qry_bar_cat_idx[idx]].unsqueeze(0)  # [1, d]
         else:
             raise RuntimeError("CTASMPDataset requires precompute=True")
 
@@ -746,8 +802,6 @@ class CTASMPDataModule(pl.LightningDataModule):
         cfg = self.cfg
         max_rows_key = f"max_rows_{split}"
         _max_rows = cfg.data.get(max_rows_key)
-        if _max_rows is not None:
-            _max_rows += 1  # +1: header row is separate, user count is for data rows
         return CTASMPDataset(
             data_path=data_path,
             model_type=cfg.embedder.model_type,
@@ -765,15 +819,26 @@ class CTASMPDataModule(pl.LightningDataModule):
             embed_cache_dir=cfg.embedder.get("embed_cache_dir"),
             cat_qry_template=cfg.query.cat_qry_template,
             cat_qry_bar_template=cfg.query.cat_qry_bar_template,
+            expected_embed_dim=int(cfg.embedder.embed_dim) if cfg.embedder.get("embed_dim") else None,
         )
 
     def setup(self, stage: Optional[str] = None) -> None:
         paths = resolve_data_paths(self.cfg.data)
         if stage in (None, "fit"):
+            t0 = time.perf_counter()
+            print("[CTA][SMP][setup] building train dataset …", flush=True)
             self.train_ds = self._make_dataset(paths["train"], "train")
+            print("[CTA][SMP][setup] building dev dataset …", flush=True)
             self.val_ds   = self._make_dataset(paths["dev"],   "dev")
             self.embed_dim = self.train_ds.embed_dim
             self._dataset = self.train_ds
+            print(
+                f"[CTA][SMP][setup] fit datasets ready "
+                f"train_tables={len(self.train_ds.records)} train_paths={len(self.train_ds)} "
+                f"dev_tables={len(self.val_ds.records)} dev_paths={len(self.val_ds)} "
+                f"embed_dim={self.embed_dim} elapsed={time.perf_counter() - t0:.1f}s",
+                flush=True,
+            )
 
     def train_dataloader(self) -> DataLoader:
         nw = self.cfg.pretraining.dataloader_num_workers
