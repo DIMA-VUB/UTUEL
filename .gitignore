@@ -1,3 +1,4 @@
+!*.* unignores all files with an extension.
 .venv/
 __pycache__/
 *.pyc
@@ -15,10 +16,17 @@ TRL-model/optuna.db
 =*
 __pycache__/
 *.log
-*.ckpt
+*.
+*.npz
+*.pt
+*.file
 *.db
 '*
-
+*.png
+*.jpg
+*.jpeg
+*.svg
+*.pdf
 datasets_TRL/**
 CTA/checkpoints/**
 CTA/lightning_logs/**

@@ -7,10 +7,13 @@ Output schema per record:
   table_id      — from source record
   ground_truth  — from source record's "answers" field (list)
   question      — from source record
+    prompt        — input prompt sent to model
   model         — model name (from folder or record)
   run           — run number
   response      — raw model response string
   prediction    — answer extracted from response JSON {"answer": "..."}
+    token_in_prompt  — whitespace token count of input prompt
+    token_in_output  — whitespace token count of output response
 
 Usage (importable):
   from prompts_pipeline.compile import compile_dataset, compile_all
@@ -27,6 +30,17 @@ from pathlib import Path
 
 
 # ── prediction extraction ─────────────────────────────────────────────────────
+
+def _count_tokens(text: str | None) -> int:
+    """
+    Return a simple whitespace token count for text.
+
+    This is a lightweight proxy count that works across providers even when
+    model-specific tokenizer metadata is not available in the raw run file.
+    """
+    if not text:
+        return 0
+    return len(re.findall(r"\S+", str(text)))
 
 def _extract_prediction(response: str | None) -> str | None:
     """
@@ -137,16 +151,21 @@ def compile_dataset(dataset_dir: Path) -> Path:
                     prediction = _extract_prediction(record.get("response"))
                     ground_truth = record.get("answers")  # list[str]
                     parse_ok = prediction is not None
+                    prompt_text = record.get("prompt")
+                    response_text = record.get("response")
                     compiled = {
                         "table_id":     record.get("table_id"),
                         "ground_truth": ground_truth,
                         "question":     record.get("question"),
+                        "prompt":       prompt_text,
                         "model":        record.get("model"),
                         "run":          record.get("run"),
-                        "response":     record.get("response"),
+                        "response":     response_text,
                         "prediction":   prediction,
                         "parse_ok":     parse_ok,
                         "correct":      is_correct(prediction, ground_truth),
+                        "token_in_prompt": _count_tokens(prompt_text),
+                        "token_in_output": record.get("token_in_output") if record.get("token_in_output") is not None else _count_tokens(response_text),
                     }
                     out_f.write(json.dumps(compiled, ensure_ascii=False) + "\n")
                     total += 1

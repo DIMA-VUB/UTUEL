@@ -71,9 +71,18 @@ class UTUELTableEmbedder(TableRetrieverBase):
         ckpt_dir = self.project_root / embedder_cfg["checkpoint_dir"]
 
         # ── Load run_config.yaml ──────────────────────────────────────────────
+        # Some checkpoint layouts keep weights in .../<run_id>/final/ while
+        # run_config.yaml sits one level up at .../<run_id>/.
         run_cfg_path = ckpt_dir / "run_config.yaml"
         if not run_cfg_path.exists():
-            raise FileNotFoundError(f"run_config.yaml not found in {ckpt_dir}")
+            parent_cfg = ckpt_dir.parent / "run_config.yaml"
+            if parent_cfg.exists():
+                run_cfg_path = parent_cfg
+                print(f"  [UTUEL] run_config.yaml not found in {ckpt_dir}, using parent: {parent_cfg}")
+            else:
+                raise FileNotFoundError(
+                    f"run_config.yaml not found in {ckpt_dir} or its parent {ckpt_dir.parent}"
+                )
         with run_cfg_path.open(encoding="utf-8") as f:
             self.run_cfg = yaml.safe_load(f)
 
@@ -206,7 +215,7 @@ class UTUELTableEmbedder(TableRetrieverBase):
                 merged_t2i = dict(cached_t2i)
                 for i, t in enumerate(need_embed):
                     merged_t2i[t] = start + i
-                merged_embs = torch.cat([cached_embs, new_tensor], dim=0)
+                merged_embs = torch.cat([cached_embs, new_tensor[...,:cached_embs.shape[1]]], dim=0)
             else:
                 merged_t2i  = {t: i for i, t in enumerate(need_embed)}
                 merged_embs = new_tensor
@@ -240,9 +249,10 @@ class UTUELTableEmbedder(TableRetrieverBase):
             emb_cfg    = self.run_cfg.get("embedder", {})
             model_type = emb_cfg.get("model_type", "huggingface")
             model_name = emb_cfg.get("model_name", "sentence-transformers/all-MiniLM-L6-v2")
+            print(f' [UTUEL] lazy-loading base embedder: {model_type} / {model_name}/{emb_cfg.get("base_url")}')
             if model_type == "ollama":
                 from langchain_ollama import OllamaEmbeddings  # type: ignore[import-untyped]
-                base_url = emb_cfg.get("base_url", "http://localhost:11434")
+                base_url = emb_cfg.get("base_url", "http://127.0.0.1:11434")
                 self._base_embedder = ("ollama", OllamaEmbeddings(
                     base_url = base_url.rstrip("/"),
                     model    = model_name,
