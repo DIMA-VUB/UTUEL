@@ -60,6 +60,12 @@ parser.add_argument("--split",         default="test",
                     choices=["train", "dev", "test"])
 parser.add_argument("--include_header_emb", action="store_true", default=False,
                     help="Include the column header node embedding in the column-level mean-pool")
+parser.add_argument("--model_name",     default=None,
+                    help="Embedder model name (overrides config embedder.model_name)")
+parser.add_argument("--model_type",     default=None,
+                    help="Embedder model type (overrides config embedder.model_type)")
+parser.add_argument("--embed_cache_dir", default=None,
+                    help="Embedding cache directory (overrides config embedder.embed_cache_dir)")
 parser.add_argument("--output_dir",    default="CTA/outputs/embedding_viz")
 args, _unknown = parser.parse_known_args()
 
@@ -81,6 +87,20 @@ except NameError:
 # --data_folder always wins (avoids backslash parsing issues)
 if args.data_folder:
     OmegaConf.update(cfg, "data.folder", args.data_folder, merge=True)
+
+# CLI embedder overrides win over config (so cache + model match the trained run)
+if args.model_name:
+    OmegaConf.update(cfg, "embedder.model_name", args.model_name, merge=True)
+if args.model_type:
+    OmegaConf.update(cfg, "embedder.model_type", args.model_type, merge=True)
+if args.embed_cache_dir:
+    OmegaConf.update(cfg, "embedder.embed_cache_dir", args.embed_cache_dir, merge=True)
+
+# Model slug — sanitized embedder name used in output filenames
+MODEL_SLUG = (
+    str(cfg.embedder.model_name).split("/")[-1].replace(" ", "_").replace(":", "#")
+    if cfg.embedder.get("model_name") else "model"
+)
 
 paths     = resolve_data_paths(cfg.data)
 type2idx, idx2type = load_type_vocab(paths["type_vocab"])
@@ -357,7 +377,7 @@ for ax, (cfg_label, vecs, meta) in zip(axes1, all_node):
     _make_legend(ax, meta, show_node_type=True)
 
 fig1.tight_layout()
-out1 = OUT_DIR / f"node_embeddings_{args.split}.png"
+out1 = OUT_DIR / f"node_embeddings_{MODEL_SLUG}_{args.split}.png"
 fig1.savefig(out1, dpi=150, bbox_inches="tight")
 print(f"[viz] saved → {out1}")
 plt.show()
@@ -379,7 +399,7 @@ for ax, (cfg_label, vecs, meta) in zip(axes2, all_col):
     _make_legend(ax, meta, show_node_type=False)
 
 fig2.tight_layout()
-out2 = OUT_DIR / f"column_embeddings_{args.split}.png"
+out2 = OUT_DIR / f"column_embeddings_{MODEL_SLUG}_{args.split}.png"
 fig2.savefig(out2, dpi=150, bbox_inches="tight")
 print(f"[viz] saved → {out2}")
 plt.show()

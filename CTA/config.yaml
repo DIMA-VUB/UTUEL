@@ -35,10 +35,10 @@ model:
 # ── JEPA loss weights (pretraining stage) ─────────────────────────────────────
 # Each weight scales its loss term.  Set to 0.0 to disable a term.
 loss:
-  jepa: 1.0      # JEPA prediction loss  — predictor(h_node_a) ≈ target_enc(query)[CLS]
-  jepa_bar: 1.0  # JEPA bar loss         — predictor(h_node_b from SMP_bar) ≈ target_enc(query)[CLS]
+  jepa: 0.0      # JEPA prediction loss  — predictor(h_node_a) ≈ target_enc(query)[CLS]
+  jepa_bar: 0.0  # JEPA bar loss         — predictor(h_node_b from SMP_bar) ≈ target_enc(query)[CLS]
   local: 1.0     # local InfoNCE         — node_a ↔ {pivot_a, node_b, pivot_b}
-  global: 1.0    # global SMP InfoNCE    — CLS[SMP[i]] ↔ CLS[SMP_bar[i]]
+  global: 0.0    # global SMP InfoNCE    — CLS[SMP[i]] ↔ CLS[SMP_bar[i]]
 
 # ── SMP generation (pretraining stage) ───────────────────────────────────────
 # Controls how U-paths are produced from each CTA table.
@@ -56,11 +56,18 @@ classifier:
   pool_mode: mean          # 'mean' | 'max' | 'cls' | 'attention'
                             # aggregates node_a embeddings → column embedding
   freeze_encoder: false    # true = freeze the pretrained JEPA encoder weights
-  embed_mode: column       # 'column' : mean-pool all node reps → one emb per column
-                            # 'cell'   : keep each node rep separately;
-                            #            final prediction = average logits (soft majority vote)
+  embed_mode: cell       # 'column'      : mean-pool all node reps → one emb per column
+                            # 'cell'        : keep each node rep separately;
+                            #                 final prediction = average logits (soft majority vote)
+                            # 'cell_header' : like 'cell' but use the header token (pivot_a/pivot_b) as the rep
   intermediate_size: null   # null = LayerNorm→Linear only; int = add hidden layer
                             #   LayerNorm→Linear(embed_dim, N)→GELU→Dropout→Linear(N, num_classes)
+  pos_weight: null         # BCE positive-class weight (class imbalance):
+                            #   null     : disabled (plain BCE)
+                            #   float    : fixed scalar weight on every positive (e.g. 10.0)
+                            #   'inline' : per-batch per-class (#neg/#pos) computed inline
+                            #              from the batch target, capped by pos_weight_max
+  pos_weight_max: 100.0    # cap for 'inline' per-class weights (ignored otherwise)
   include_header_emb: true # true = include the column's own header node embedding in the
                             #   column-level mean-pool (alongside the cell node reps).
                             #   In cell mode the header is appended as an extra cell entry.
@@ -110,6 +117,11 @@ embedder:
   embed_dim: 384             # must match the model output (384 for all-MiniLM-L6-v2)
   cache_embeddings: true
   embed_cache_dir: CTA/.cache
+  use_global_cache: true    # true = fill U-path embeddings from the merged
+                             # global_{model}_smp.embed_cache.pt (no re-embedding;
+                             # only texts missing from the global cache are embedded)
+  include_query: false       # true = also build/fill the SMP query-sentence
+                             # embeddings; false = document (cell/header) embeds only
 
 # ── Query templates (pretraining) ─────────────────────────────────────────────
 # Same placeholders as TRL-model: pivot_a, node_a, node_b, pivot_b.
@@ -121,7 +133,7 @@ query:
 pretraining:
   output_dir: CTA/checkpoints/pretrain
   epochs: 50
-  batch_size: 128           # must be even (query-loss pairing)
+  batch_size: 64           # must be even (query-loss pairing)
   lr: 1.0e-4
   weight_decay: 1.0e-2
   max_grad_norm: 2.0
@@ -143,18 +155,18 @@ finetuning:
   output_dir: CTA/checkpoints/finetune
   epochs: 20
   batch_size: 64
-  lr: 3.0e-4
-  weight_decay: 1.0e-2
-  max_grad_norm: 1.0
-  fp16: true
+  lr: 1.0e-3
+  weight_decay: 2.0e-2
+  max_grad_norm: null
+  fp16: false
   bf16: false
   dataloader_num_workers: 4
   logging_steps: 10
   save_total_limit: 3
   seed: 42
   label_smoothing: 0.0      # CrossEntropy label-smoothing epsilon
-  early_stopping_patience: 5
-  early_stopping_min_delta: 1.0e-4
+  early_stopping_patience: 20
+  early_stopping_min_delta: 1.0e-5
   ckpt_path: null
 
 # ── Evaluation ─────────────────────────────────────────────────────────────────

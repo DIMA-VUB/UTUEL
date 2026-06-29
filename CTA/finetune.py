@@ -109,7 +109,7 @@ def extract_column_embeddings(
     smp_ds: CTASMPDataset,
     type2idx: dict[str, int],
     col_types_per_table: dict[str, list[list[str]]],   # table_id → [n_cols][n_types]
-    embed_mode: str = "column",   # 'column' | 'cell'
+    embed_mode: str = "column",   # 'column' | 'cell' | 'cell_header'
     smp_source: str = "smp",     # 'smp' | 'smp_bar' | 'both'
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """
@@ -131,6 +131,10 @@ def extract_column_embeddings(
 
     embed_mode='cell'
         One sample per eligible U-path → [4, d_llm] per path.
+
+    embed_mode='cell_header'
+        One sample per eligible U-path (like 'cell'), but the header token is
+        used as the column representative: pivot_a when smp, pivot_b when smp_bar.
 
     The 4 positions are always in canonical U-path order:
         [0] pivot_a  — column header of the a-side column
@@ -214,7 +218,7 @@ def extract_column_embeddings(
                 embs_list.append(pooled)
                 multi_hot_list.append(hot)
                 col_ids_list.append(col_counter)
-            else:  # cell — one [4, d_llm] entry per U-path
+            else:  # cell / cell_header — one [4, d_llm] entry per U-path
                 if js_a:
                     idx_a  = torch.tensor(js_a, dtype=torch.long)
                     paths_a = F.normalize(
@@ -276,6 +280,9 @@ class CTAClassifier(pl.LightningModule):
         cell   + smp      → node_a                              → [B, d]  → head → [B, C]
         cell   + smp_bar  → node_b                              → [B, d]  → head → [B, C]
         cell   + both     → stack(node_a, node_b)               → [2B, d] → head → [2B, C] → mean → [B, C]
+        cell_header + smp      → pivot_a                         → [B, d]  → head → [B, C]
+        cell_header + smp_bar  → pivot_b                         → [B, d]  → head → [B, C]
+        cell_header + both     → stack(pivot_a, pivot_b)         → [2B, d] → head → [2B, C] → mean → [B, C]
 
     ``freeze_encoder=True``  : encoder weights are frozen — only the head trains.
     ``freeze_encoder=False`` : encoder trains jointly with the head.
@@ -292,7 +299,7 @@ class CTAClassifier(pl.LightningModule):
         embed_dim: int,                      # d_llm: raw LLM embedding size
         head_dim: int,                       # d_model (encoder out) or d_llm if no encoder
         num_classes: int,
-        embed_mode: str = "column",          # 'column' | 'cell'
+        embed_mode: str = "column",          # 'column' | 'cell' | 'cell_header'
         smp_source: str = "smp",             # 'smp' | 'smp_bar' | 'both'
         intermediate_size: int | None = None,
         lr: float = 3e-4,
@@ -303,6 +310,9 @@ class CTAClassifier(pl.LightningModule):
         encoder: "TableEmbedJePA | None" = None,
         encoder_config_dict: dict | None = None,  # saved in hparams for ckpt reload
         freeze_encoder: bool = False,
+        # ── loss ─────────────────────────────────────────────────────────────
+        pos_weight: "str | float | None" = None,   # None | float | 'inline'
+        pos_weight_max: float = 100.0,             # cap for 'inline' per-class weights
     ) -> None:
         super().__init__()
         self.save_hyperparameters(ignore=["encoder"])
@@ -339,6 +349,19 @@ class CTAClassifier(pl.LightningModule):
                 torch.nn.Linear(head_dim, num_classes),
             )
         self.bce = torch.nn.BCEWithLogitsLoss()
+
+        # ── BCE positive-class weighting (class imbalance) ────────────────────
+        #   None     → no weighting (plain BCE)
+        #   float    → fixed scalar weight applied to every positive
+        #   'inline' → per-batch per-class weight = (#neg / #pos) computed inline
+        #              from the batch target inside _step (capped by pos_weight_max)
+        self.pos_weight_cfg = pos_weight
+        self.pos_weight_max = float(pos_weight_max)
+        self._pos_weight_scalar = (
+            float(pos_weight)
+            if isinstance(pos_weight, (int, float)) and not isinstance(pos_weight, bool)
+            else None
+        )
 
         def _metrics() -> torch.nn.ModuleDict:
             return torch.nn.ModuleDict({
@@ -421,6 +444,14 @@ class CTAClassifier(pl.LightningModule):
                 rep = (pb + nb) * 0.5                                     # [B, d]
             else:  # both → stack → [2B, d]
                 rep = torch.cat([(pa + na) * 0.5, (pb + nb) * 0.5], dim=0)
+        elif em == "cell_header":
+            # use only the header token (pivot) as the column representative
+            if src == "smp":
+                rep = pa                                                   # [B, d]
+            elif src == "smp_bar":
+                rep = pb                                                   # [B, d]
+            else:  # both → stack → [2B, d]
+                rep = torch.cat([pa, pb], dim=0)
         else:  # cell
             if src == "smp":
                 rep = na                                                   # [B, d]
@@ -434,10 +465,39 @@ class CTAClassifier(pl.LightningModule):
             logits = logits.view(2, B, -1).mean(dim=0)                    # [B, C]
         return logits
 
+    def _batch_pos_weight(self, target: torch.Tensor) -> "torch.Tensor | None":
+        """BCE pos_weight computed inline from the batch target.
+
+        Returns None when weighting is disabled.  For 'inline' mode the weight
+        for class c is (#negatives / #positives) within this batch; classes
+        absent from the batch get a neutral weight of 1.0.
+        """
+        mode = self.pos_weight_cfg
+        if mode is None:
+            return None
+        if self._pos_weight_scalar is not None:
+            return torch.full(
+                (target.shape[1],), self._pos_weight_scalar,
+                dtype=target.dtype, device=target.device,
+            )
+        if isinstance(mode, str) and mode.lower() in ("inline", "auto", "batch"):
+            pos = target.sum(dim=0)                       # [C] positives in batch
+            neg = target.shape[0] - pos                   # [C] negatives in batch
+            pw  = (neg / pos.clamp(min=1.0)).clamp(max=self.pos_weight_max)
+            pw[pos == 0] = 1.0                            # classes absent in batch → neutral
+            return pw
+        return None
+
     def _step(self, batch: tuple, split: str) -> torch.Tensor:
         col_embs, multi_hot = batch          # [B, 4, d_llm], [B, C] float
         logits = self(col_embs)              # [B, C]
-        loss   = self.bce(logits, multi_hot)
+        pos_weight = self._batch_pos_weight(multi_hot)
+        if pos_weight is not None:
+            loss = F.binary_cross_entropy_with_logits(
+                logits, multi_hot, pos_weight=pos_weight
+            )
+        else:
+            loss = self.bce(logits, multi_hot)
         probs  = torch.sigmoid(logits)       # [B, C]
         target = multi_hot.long()            # [B, C] int
 
@@ -464,10 +524,19 @@ class CTAClassifier(pl.LightningModule):
             lr=self.hparams.lr,
             weight_decay=self.hparams.weight_decay,
         )
-        sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-            opt, T_max=self.hparams.max_epochs, eta_min=self.hparams.lr
+        # sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        #     opt, T_max=self.hparams.max_epochs, eta_min=self.hparams.lr
+        # )
+        # return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "epoch"}}
+        # + add this scheduler
+        sched = torch.optim.lr_scheduler.ReduceLROnPlateau(
+            opt,
+            mode="max",        # maximizing F1
+            patience=3,
+            factor=0.5,
+            min_lr=1e-6
         )
-        return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "epoch"}}
+        return {"optimizer": opt, "lr_scheduler": {"scheduler": sched, "interval": "epoch","monitor": "val/f1_micro"}}
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -488,8 +557,8 @@ def main(cfg: DictConfig) -> float:
     threshold  = float(OmegaConf.select(cfg, "eval.threshold", default=0.5))
     embed_mode         = str(OmegaConf.select(cfg, "classifier.embed_mode",         default="column"))
     smp_source         = str(OmegaConf.select(cfg, "classifier.smp_source",         default="smp"))
-    if embed_mode not in ("column", "cell"):
-        raise ValueError(f"classifier.embed_mode must be 'column' or 'cell', got {embed_mode!r}")
+    if embed_mode not in ("column", "cell", "cell_header"):
+        raise ValueError(f"classifier.embed_mode must be 'column', 'cell' or 'cell_header', got {embed_mode!r}")
     if smp_source not in ("smp", "smp_bar", "both"):
         raise ValueError(f"classifier.smp_source must be 'smp', 'smp_bar', or 'both', got {smp_source!r}")
 
@@ -579,6 +648,8 @@ def main(cfg: DictConfig) -> float:
             cat_qry_template=cfg.query.cat_qry_template,
             cat_qry_bar_template=cfg.query.cat_qry_bar_template,
             expected_embed_dim=int(cfg.embedder.embed_dim) if cfg.embedder.get("embed_dim") else None,
+            use_global_cache=cfg.embedder.get("use_global_cache", False),
+            include_query=cfg.embedder.get("include_query", False),
         )
 
     def _load_col_types(data_path: str) -> dict[str, list[list[str]]]:
@@ -655,6 +726,8 @@ def main(cfg: DictConfig) -> float:
         encoder=encoder,
         encoder_config_dict=encoder_config_dict,
         freeze_encoder=freeze_encoder,
+        pos_weight=OmegaConf.select(cfg, "classifier.pos_weight"),
+        pos_weight_max=float(OmegaConf.select(cfg, "classifier.pos_weight_max") or 100.0),
     )
     enc_mode_str = (
         f"pretrained+{'frozen' if freeze_encoder else 'joint'}"

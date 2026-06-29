@@ -42,14 +42,13 @@ from __future__ import annotations
 import json
 import sys
 import time
-from collections import defaultdict
 from pathlib import Path
 from typing import Optional, Union
 
 import pytorch_lightning as pl
 import torch
-import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset
+from tqdm.auto import tqdm
 
 try:
     from .dataset_utils import get_embedder, load_type_vocab, resolve_data_paths
@@ -522,6 +521,8 @@ class CTASMPDataset(Dataset):
         cat_qry_template: str = "{pivot_b} ... {pivot_a}({node_a})?",
         cat_qry_bar_template: str = "{pivot_a} ... {pivot_b}({node_b})?",
         expected_embed_dim: Optional[int] = None,
+        use_global_cache: bool = False,
+        include_query: bool = False,
     ) -> None:
         data_path = Path(data_path)
         self._model_type   = model_type
@@ -587,7 +588,6 @@ class CTASMPDataset(Dataset):
 
         # ── Precompute embeddings ─────────────────────────────────────────────
         self._embed_cache: Optional[torch.Tensor] = None
-        self._text_to_idx: Optional[dict]         = None
         self._smp_idx:         Optional[torch.Tensor] = None  # [N, 4]
         self._qry_cat_idx:     Optional[torch.Tensor] = None  # [N]
         self._qry_bar_cat_idx: Optional[torch.Tensor] = None  # [N]
@@ -598,6 +598,8 @@ class CTASMPDataset(Dataset):
                 embed_cache_dir,
                 data_path,
                 expected_embed_dim,
+                use_global_cache,
+                include_query,
             )
 
     # ── Embedding ─────────────────────────────────────────────────────────────
@@ -608,6 +610,8 @@ class CTASMPDataset(Dataset):
         embed_cache_dir: Optional[Union[str, Path]],
         data_path: Path,
         expected_embed_dim: Optional[int] = None,
+        use_global_cache: bool = False,
+        include_query: bool = False,
     ) -> None:
         slug = (
             f"{data_path.stem}_"
@@ -622,7 +626,7 @@ class CTASMPDataset(Dataset):
             flush=True,
         )
 
-        if cache_embeddings and cache_file.exists():
+        if cache_embeddings and cache_file.exists() and not use_global_cache:
             ckpt = torch.load(cache_file, map_location="cpu")
             self._doc_embed_cache = ckpt.get("doc_embed_cache", ckpt.get("embed_cache"))
             self._qry_embed_cache = ckpt.get("qry_embed_cache")
@@ -635,7 +639,26 @@ class CTASMPDataset(Dataset):
             if self._qry_embed_cache is None and self._doc_embed_cache is not None:
                 self._qry_embed_cache = self._doc_embed_cache
 
-            if self._doc_embed_cache is not None:
+            # Reject a stale cache: the saved _smp_idx must match the current
+            # samples (count) and never point past the embedding rows.  This
+            # guards against reusing a cache built with a different U-path
+            # generation (e.g. after changing smp.generate_u_paths_flat).
+            n_doc = self._doc_embed_cache.shape[0] if self._doc_embed_cache is not None else 0
+            cache_ok = (
+                self._doc_embed_cache is not None
+                and self._smp_idx is not None
+                and self._smp_idx.shape[0] == len(self._samples)
+                and (self._smp_idx.numel() == 0 or int(self._smp_idx.max()) < n_doc)
+            )
+            if not cache_ok and self._doc_embed_cache is not None:
+                print(
+                    f"[CTA][SMP][cache] stale {cache_file.name} "
+                    f"(smp_idx rows={None if self._smp_idx is None else self._smp_idx.shape[0]} "
+                    f"vs samples={len(self._samples)}; embed rows={n_doc}) — recomputing",
+                    flush=True,
+                )
+
+            if cache_ok:
                 self._embed_cache = self._doc_embed_cache
                 self._embed_dim = int(self._doc_embed_cache.shape[1])
                 if expected_embed_dim is not None and self._embed_cache.shape[1] > expected_embed_dim:
@@ -643,7 +666,6 @@ class CTASMPDataset(Dataset):
                     self._qry_embed_cache = self._qry_embed_cache[:, :expected_embed_dim]
                     self._embed_cache = self._doc_embed_cache
                     self._embed_dim = expected_embed_dim
-                self._text_to_idx = self._doc_text_to_idx
                 print(
                     f"[CTA][SMP][cache] loaded {cache_file.name} "
                     f"doc_texts={len(self._doc_text_to_idx)} qry_texts={len(self._qry_text_to_idx)}",
@@ -658,13 +680,14 @@ class CTASMPDataset(Dataset):
             for txt in (up.col_header_a, up.cell_value_a, up.cell_value_b, up.col_header_b):
                 if txt not in doc_text_to_idx:
                     doc_text_to_idx[txt] = len(doc_text_to_idx)
-            fmt = dict(
-                pivot_a=up.col_header_a, node_a=up.cell_value_a,
-                node_b=up.cell_value_b, pivot_b=up.col_header_b,
-            )
-            for txt in (self._cat_qry_tmpl.format(**fmt), self._cat_qry_bar_tmpl.format(**fmt)):
-                if txt not in query_text_to_idx:
-                    query_text_to_idx[txt] = len(query_text_to_idx)
+            if include_query:
+                fmt = dict(
+                    pivot_a=up.col_header_a, node_a=up.cell_value_a,
+                    node_b=up.cell_value_b, pivot_b=up.col_header_b,
+                )
+                for txt in (self._cat_qry_tmpl.format(**fmt), self._cat_qry_bar_tmpl.format(**fmt)):
+                    if txt not in query_text_to_idx:
+                        query_text_to_idx[txt] = len(query_text_to_idx)
 
         ordered_doc = [""] * len(doc_text_to_idx)
         for txt, i in doc_text_to_idx.items():
@@ -674,34 +697,142 @@ class CTASMPDataset(Dataset):
         for txt, i in query_text_to_idx.items():
             ordered_query[i] = txt
 
+        # ── Optional: preload embeddings from the merged GLOBAL cache ─────────
+        # When use_global_cache is set, every document / query text already
+        # present in global_{model}_smp.embed_cache.pt is filled straight from
+        # that tensor (no re-embedding); only texts missing from the global
+        # cache are sent to the embedder.
+        doc_bank: dict[str, torch.Tensor] = {}
+        qry_bank: dict[str, torch.Tensor] = {}
+        global_file = None
+        global_missing = False
+        if use_global_cache:
+            model_slug = (self._model_name or self._model_type).replace("/", "-")
+            global_file = cache_dir / f"global_{model_slug}_smp.embed_cache.pt"
+            if global_file.exists():
+                g = torch.load(global_file, map_location="cpu")
+                g_doc_emb = g.get("doc_embed_cache", g.get("embed_cache"))
+                g_doc_t2i = g.get("doc_text_to_idx", g.get("text_to_idx", {}))
+                if g_doc_emb is not None:
+                    for t, i in g_doc_t2i.items():
+                        doc_bank[t] = g_doc_emb[i]
+                if include_query:
+                    g_qry_emb = g.get("qry_embed_cache")
+                    g_qry_t2i = g.get("qry_text_to_idx", {})
+                    if g_qry_emb is not None:
+                        for t, i in g_qry_t2i.items():
+                            qry_bank[t] = g_qry_emb[i]
+                print(
+                    f"[CTA][SMP][global] loaded {global_file.name} "
+                    f"doc_texts={len(doc_bank)} qry_texts={len(qry_bank)}",
+                    flush=True,
+                )
+            else:
+                global_missing = True
+                print(
+                    f"[CTA][SMP][global] {global_file.name} not found — "
+                    f"embedding all texts and building it",
+                    flush=True,
+                )
+
         print(
             f"[CTA][SMP][embed] {len(ordered_doc)} unique documents + {len(ordered_query)} unique queries …",
             flush=True,
         )
-        if hasattr(self._embedder, "encode_documents"):
-            self._doc_embed_cache = torch.tensor(self._embedder.encode_documents(ordered_doc), dtype=torch.float32)
-        else:
-            self._doc_embed_cache = torch.tensor(self._embedder.embed_documents(ordered_doc), dtype=torch.float32)
 
-        if hasattr(self._embedder, "encode_queries"):
-            qry_vecs = self._embedder.encode_queries(ordered_query)
-        elif hasattr(self._embedder, "embed_query"):
-            qry_vecs = [self._embedder.embed_query(t) for t in ordered_query]
-        else:
-            qry_vecs = self._embedder.embed_documents(ordered_query)
-        self._qry_embed_cache = torch.tensor(qry_vecs, dtype=torch.float32)
+        def _doc_embed_fn(texts: list[str]):
+            if hasattr(self._embedder, "encode_documents"):
+                return self._embedder.encode_documents(texts)
+            return self._embedder.embed_documents(texts)
+
+        def _qry_embed_fn(texts: list[str]):
+            if hasattr(self._embedder, "encode_queries"):
+                return self._embedder.encode_queries(texts)
+            if hasattr(self._embedder, "embed_query"):
+                return [self._embedder.embed_query(t) for t in texts]
+            return self._embedder.embed_documents(texts)
+
+        def _fill(ordered: list[str], bank: dict, embed_fn, label: str) -> torch.Tensor:
+            """Gather embeddings for ``ordered`` — cache hits from ``bank``,
+            misses embedded once and added back into the bank."""
+            missing = [t for t in ordered if t not in bank]
+            n_hit = len(ordered) - len(missing)
+            if missing:
+                print(
+                    f"[CTA][SMP][embed] {len(missing)}/{len(ordered)} {label} "
+                    f"not in cache — embedding …",
+                    flush=True,
+                )
+                bs = max(1, int(getattr(self._embedder, "batch_size", 64) or 64))
+                for s in tqdm(
+                    range(0, len(missing), bs),
+                    desc=f"[CTA][SMP][embed] {label}",
+                    unit="batch",
+                    total=(len(missing) + bs - 1) // bs,
+                ):
+                    chunk = missing[s : s + bs]
+                    vecs = embed_fn(chunk)
+                    for t, v in zip(chunk, vecs):
+                        bank[t] = torch.as_tensor(v, dtype=torch.float32)
+            elif ordered:
+                print(
+                    f"[CTA][SMP][embed] all {len(ordered)} {label} served from cache",
+                    flush=True,
+                )
+            out = torch.stack(
+                [torch.as_tensor(bank[t], dtype=torch.float32) for t in ordered]
+            )
+            norms = out.norm(dim=1)
+            print(
+                f"[CTA][SMP][embed][stat] {label}: total={len(ordered)} "
+                f"cache_hit={n_hit} embedded={len(missing)} "
+                f"shape={tuple(out.shape)} "
+                f"norm[min/mean/max]="
+                f"{norms.min():.3f}/{norms.mean():.3f}/{norms.max():.3f}",
+                flush=True,
+            )
+            return out
+
+        self._doc_embed_cache = _fill(ordered_doc, doc_bank, _doc_embed_fn, "documents")
+        self._qry_embed_cache = (
+            _fill(ordered_query, qry_bank, _qry_embed_fn, "queries")
+            if include_query else None
+        )
 
         self._embed_dim = int(self._doc_embed_cache.shape[1])
 
         if expected_embed_dim is not None and self._doc_embed_cache.shape[1] > expected_embed_dim:
             self._doc_embed_cache = self._doc_embed_cache[:, :expected_embed_dim]
-            self._qry_embed_cache = self._qry_embed_cache[:, :expected_embed_dim]
+            if self._qry_embed_cache is not None:
+                self._qry_embed_cache = self._qry_embed_cache[:, :expected_embed_dim]
             self._embed_dim = expected_embed_dim
 
         self._doc_text_to_idx = doc_text_to_idx
         self._qry_text_to_idx = query_text_to_idx
         self._embed_cache = self._doc_embed_cache
-        self._text_to_idx = self._doc_text_to_idx
+
+        # When the global cache was requested but missing, build it now in the
+        # same format the Section-7 merge produces so subsequent runs reuse it.
+        if use_global_cache and global_missing and global_file is not None:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            global_payload = {
+                "doc_embed_cache": self._doc_embed_cache,
+                "doc_text_to_idx": self._doc_text_to_idx,
+                "embed_dim":       int(self._doc_embed_cache.shape[1]),
+                "model_name":      self._model_name or self._model_type,
+                "merged_from":     [data_path.name],
+            }
+            if self._qry_embed_cache is not None:
+                global_payload["qry_embed_cache"] = self._qry_embed_cache
+                global_payload["qry_text_to_idx"] = self._qry_text_to_idx
+            torch.save(global_payload, global_file)
+            print(
+                f"[CTA][SMP][global] built {global_file.name}  "
+                f"doc_texts={len(self._doc_text_to_idx)} "
+                f"qry_texts={len(self._qry_text_to_idx) if self._qry_embed_cache is not None else 0}  "
+                f"({global_file.stat().st_size / 1024**2:.1f} MB)",
+                flush=True,
+            )
 
         smp_rows, qry_rows, qry_bar_rows = [], [], []
         for _, up in self._samples:
@@ -711,28 +842,35 @@ class CTASMPDataset(Dataset):
                 doc_text_to_idx[up.cell_value_b],
                 doc_text_to_idx[up.col_header_b],
             ])
-            fmt = dict(
-                pivot_a=up.col_header_a, node_a=up.cell_value_a,
-                node_b=up.cell_value_b, pivot_b=up.col_header_b,
-            )
-            qry_rows.append(query_text_to_idx[self._cat_qry_tmpl.format(**fmt)])
-            qry_bar_rows.append(query_text_to_idx[self._cat_qry_bar_tmpl.format(**fmt)])
+            if include_query:
+                fmt = dict(
+                    pivot_a=up.col_header_a, node_a=up.cell_value_a,
+                    node_b=up.cell_value_b, pivot_b=up.col_header_b,
+                )
+                qry_rows.append(query_text_to_idx[self._cat_qry_tmpl.format(**fmt)])
+                qry_bar_rows.append(query_text_to_idx[self._cat_qry_bar_tmpl.format(**fmt)])
 
         self._smp_idx = torch.tensor(smp_rows, dtype=torch.long)
-        self._qry_cat_idx = torch.tensor(qry_rows, dtype=torch.long)
-        self._qry_bar_cat_idx = torch.tensor(qry_bar_rows, dtype=torch.long)
+        self._qry_cat_idx = torch.tensor(qry_rows, dtype=torch.long) if include_query else None
+        self._qry_bar_cat_idx = torch.tensor(qry_bar_rows, dtype=torch.long) if include_query else None
 
-        if cache_embeddings:
-            torch.save({
+        # Skip writing the per-split cache when the global cache is in use —
+        # the merged global_{model}_smp.embed_cache.pt is the single source.
+        if cache_embeddings and not use_global_cache:
+            payload = {
                 "doc_embed_cache": self._doc_embed_cache,
-                "qry_embed_cache": self._qry_embed_cache,
                 "doc_text_to_idx": self._doc_text_to_idx,
-                "qry_text_to_idx": self._qry_text_to_idx,
                 "smp_idx": self._smp_idx,
-                "qry_cat_idx": self._qry_cat_idx,
-                "qry_bar_cat_idx": self._qry_bar_cat_idx,
                 "embed_dim": int(self._doc_embed_cache.shape[1]),
-            }, cache_file)
+            }
+            if include_query:
+                payload.update({
+                    "qry_embed_cache": self._qry_embed_cache,
+                    "qry_text_to_idx": self._qry_text_to_idx,
+                    "qry_cat_idx": self._qry_cat_idx,
+                    "qry_bar_cat_idx": self._qry_bar_cat_idx,
+                })
+            torch.save(payload, cache_file)
             print(
                 f"[CTA][SMP][cache] saved {cache_file.name}  "
                 f"({cache_file.stat().st_size / 1024**2:.1f} MB)",
@@ -768,8 +906,12 @@ class CTASMPDataset(Dataset):
 
         if self._smp_idx is not None:
             smp_embeds = self._doc_embed_cache[self._smp_idx[idx]]  # [4, d]
-            query_embeds = self._qry_embed_cache[self._qry_cat_idx[idx]].unsqueeze(0)  # [1, d]
-            query_bar_embeds = self._qry_embed_cache[self._qry_bar_cat_idx[idx]].unsqueeze(0)  # [1, d]
+            if self._qry_cat_idx is not None and self._qry_embed_cache is not None:
+                query_embeds = self._qry_embed_cache[self._qry_cat_idx[idx]].unsqueeze(0)  # [1, d]
+                query_bar_embeds = self._qry_embed_cache[self._qry_bar_cat_idx[idx]].unsqueeze(0)  # [1, d]
+            else:
+                query_embeds = torch.zeros(1, self.embed_dim)       # queries disabled
+                query_bar_embeds = torch.zeros(1, self.embed_dim)
         else:
             raise RuntimeError("CTASMPDataset requires precompute=True")
 
@@ -820,6 +962,8 @@ class CTASMPDataModule(pl.LightningDataModule):
             cat_qry_template=cfg.query.cat_qry_template,
             cat_qry_bar_template=cfg.query.cat_qry_bar_template,
             expected_embed_dim=int(cfg.embedder.embed_dim) if cfg.embedder.get("embed_dim") else None,
+            use_global_cache=cfg.embedder.get("use_global_cache", False),
+            include_query=cfg.embedder.get("include_query", False),
         )
 
     def setup(self, stage: Optional[str] = None) -> None:

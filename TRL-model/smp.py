@@ -130,6 +130,13 @@ def generate_u_paths_flat(
 
     Single-column tables: node_a == node_b and pivot_a == pivot_b
     (the U-path collapses to a self-path on the only column).
+
+    Last column of multi-column tables: emitted with an additional self-path
+    (col_idx_a == col_idx_b == n-1, node_a == node_b, pivot_a == pivot_b) so the
+    last column appears on the a-side. In the j<k pair enumeration it would
+    otherwise only ever be col_idx_b, and would be dropped by extraction that
+    reads the a-side only (smp_source='smp'). The self-path lets column
+    extraction be applied naturally without any special-casing downstream.
     """
     out: list[UPath] = []
     n = len(header)
@@ -149,6 +156,8 @@ def generate_u_paths_flat(
             ))
         return out
 
+    last = n - 1
+    h_last = str(header[last]).strip()
     for row_idx, row in enumerate(rows):
         for j in range(n):
             ca = str(row[j]).strip() if j < len(row) else ""
@@ -161,6 +170,17 @@ def generate_u_paths_flat(
                     cell_value_b=str(row[k]).strip() if k < len(row) else "",
                     col_header_b=str(header[k]).strip(),
                 ))
+        # Self-path for the LAST column so it also lands on the a-side
+        # (mirrors the single-column branch: pivot_a == pivot_b, node_a == node_b).
+        cell_last = str(row[last]).strip() if last < len(row) else ""
+        out.append(UPath(
+            row_idx=row_idx,
+            col_idx_a=last,  col_idx_b=last,
+            col_header_a=h_last,
+            cell_value_a=cell_last,
+            cell_value_b=cell_last,
+            col_header_b=h_last,
+        ))
     return out
 
 

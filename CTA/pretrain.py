@@ -151,6 +151,17 @@ def main(cfg: DictConfig) -> float:
     )
 
     # ── Model ─────────────────────────────────────────────────────────────────
+    # When ablate_proj=true the input_projection is Identity, so hidden_size MUST
+    # match the embedder dim.  Sync it from the data (e.g. 768) so the saved
+    # run_config is correct and finetune rebuilds the encoder with the right dim.
+    if bool(OmegaConf.select(cfg, "model.ablate_proj", default=False)) \
+            and cfg.model.hidden_size != dm.embed_dim:
+        with open_dict(cfg):
+            print(
+                f"[CTA][pretrain] ablate_proj=true → overriding hidden_size "
+                f"{cfg.model.hidden_size} → embed_dim {dm.embed_dim}"
+            )
+            cfg.model.hidden_size = dm.embed_dim
     model = build_model(cfg, embed_dim_in=dm.embed_dim)
     print(
         f"[CTA][pretrain] dataset={cfg.data.train_path}"
