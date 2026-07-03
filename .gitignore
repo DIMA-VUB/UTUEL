@@ -8,11 +8,11 @@ __pycache__/
 datasets/*.jsonl
 results/
 datasets/**
-TRL-model/checkpoints/**
-TRL-model/lightning_logs/**
-TRL-model/outputs/**
-TRL-model/multirun/**
-TRL-model/optuna.db
+*/checkpoints/**
+*/lightning_logs/**
+*/outputs/**
+*/multirun**
+/optuna.db
 =*
 __pycache__/
 *.log

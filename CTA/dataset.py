@@ -45,6 +45,7 @@ import time
 from pathlib import Path
 from typing import Optional, Union
 
+import numpy as np
 import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader, Dataset
@@ -67,6 +68,44 @@ if str(_TRR) not in sys.path:
 
 from smp import UPath, generate_u_paths_flat, generate_u_paths_from_graph  # noqa: E402
 from embedder import OllamaEmbedder  # type: ignore[import]  # noqa: E402
+
+
+class _UPathLite:
+    """Memory-lean stand-in for ``smp.UPath`` holding only the fields CTA reads.
+
+    ``smp.UPath`` is a dataclass **without** ``__slots__`` that also materialises
+    ~6 derived strings (``smp_text``, ``reversed_smp_text``, ``node_a/b``,
+    ``pivot_a/b``) in ``__post_init__``.  Retaining one per U-path for a large
+    corpus (e.g. >100M U-paths) costs ~1 KB each and exhausts host RAM — the job
+    gets OOM-killed *after* the embedding gather completes.
+
+    This slotted class keeps just the six attributes consumed downstream
+    (``_precompute`` builds the index tensors; ``finetune`` / ``visualize`` read
+    ``col_idx_*``).  The four string fields are the SAME objects already stored
+    in ``CTASMPDataset.records`` (shared references — no extra allocation), so a
+    sample costs ~100 bytes instead of ~1 KB.
+    """
+
+    __slots__ = (
+        "col_idx_a", "col_idx_b",
+        "col_header_a", "cell_value_a", "cell_value_b", "col_header_b",
+    )
+
+    def __init__(
+        self,
+        col_idx_a: int,
+        col_idx_b: int,
+        col_header_a: str,
+        cell_value_a: str,
+        cell_value_b: str,
+        col_header_b: str,
+    ) -> None:
+        self.col_idx_a    = col_idx_a
+        self.col_idx_b    = col_idx_b
+        self.col_header_a = col_header_a
+        self.cell_value_a = cell_value_a
+        self.cell_value_b = cell_value_b
+        self.col_header_b = col_header_b
 
 
 # ── Dataset ───────────────────────────────────────────────────────────────────
@@ -555,7 +594,12 @@ class CTASMPDataset(Dataset):
             raw_records = raw_records[:max_records]
 
         self.records: list[dict] = []  # {"table_id", "header", "rows"}
-        self._samples: list[tuple[int, UPath]] = []  # (record_idx, upath)
+        # Store a slotted _UPathLite (not the full smp.UPath dataclass) per
+        # U-path.  UPath has no __slots__ and builds ~6 derived strings per
+        # instance; retaining millions of them exhausts host RAM.  _UPathLite
+        # keeps only the fields CTA needs, with string fields shared with
+        # self.records (no extra allocation).
+        self._samples: list[tuple[int, _UPathLite]] = []  # (record_idx, upath)
 
         for rec in raw_records:
             table_id, header, rows = _reconstruct_table(rec, max_rows_per_table)
@@ -576,9 +620,13 @@ class CTASMPDataset(Dataset):
                 upaths = generate_u_paths_flat(header, rows)
 
             for up in upaths:
-                up.table_id  = table_id
-                up.record_id = table_id
-                self._samples.append((rec_idx, up))
+                self._samples.append((rec_idx, _UPathLite(
+                    up.col_idx_a, up.col_idx_b,
+                    up.col_header_a, up.cell_value_a,
+                    up.cell_value_b, up.col_header_b,
+                )))
+            # ``upaths`` (heavyweight UPath objects) goes out of scope on the
+            # next iteration, so only one table's worth is ever alive at once.
 
         self._embed_dim: Optional[int] = None
         print(
@@ -702,8 +750,17 @@ class CTASMPDataset(Dataset):
         # present in global_{model}_smp.embed_cache.pt is filled straight from
         # that tensor (no re-embedding); only texts missing from the global
         # cache are sent to the embedder.
-        doc_bank: dict[str, torch.Tensor] = {}
-        qry_bank: dict[str, torch.Tensor] = {}
+        #
+        # Memory note: with millions of unique texts the global tensor is large
+        # (e.g. 1.2M × 768 fp32 ≈ 3.5 GB).  We therefore keep the contiguous
+        # tensor + its text→row map and gather rows lazily with a chunked
+        # index_select inside ``_fill`` — never exploding it into a per-text
+        # dict (which adds ~1 GB of Python object overhead and would OOM-kill
+        # the job on a memory-limited node).
+        g_doc_emb: Optional[torch.Tensor] = None
+        g_doc_t2i: dict[str, int] = {}
+        g_qry_emb: Optional[torch.Tensor] = None
+        g_qry_t2i: dict[str, int] = {}
         global_file = None
         global_missing = False
         if use_global_cache:
@@ -712,19 +769,14 @@ class CTASMPDataset(Dataset):
             if global_file.exists():
                 g = torch.load(global_file, map_location="cpu")
                 g_doc_emb = g.get("doc_embed_cache", g.get("embed_cache"))
-                g_doc_t2i = g.get("doc_text_to_idx", g.get("text_to_idx", {}))
-                if g_doc_emb is not None:
-                    for t, i in g_doc_t2i.items():
-                        doc_bank[t] = g_doc_emb[i]
+                g_doc_t2i = g.get("doc_text_to_idx", g.get("text_to_idx", {})) or {}
                 if include_query:
                     g_qry_emb = g.get("qry_embed_cache")
-                    g_qry_t2i = g.get("qry_text_to_idx", {})
-                    if g_qry_emb is not None:
-                        for t, i in g_qry_t2i.items():
-                            qry_bank[t] = g_qry_emb[i]
+                    g_qry_t2i = g.get("qry_text_to_idx", {}) or {}
+                del g  # drop the container dict; tensors above still reference storage
                 print(
                     f"[CTA][SMP][global] loaded {global_file.name} "
-                    f"doc_texts={len(doc_bank)} qry_texts={len(qry_bank)}",
+                    f"doc_texts={len(g_doc_t2i)} qry_texts={len(g_qry_t2i)}",
                     flush=True,
                 )
             else:
@@ -752,40 +804,100 @@ class CTASMPDataset(Dataset):
                 return [self._embedder.embed_query(t) for t in texts]
             return self._embedder.embed_documents(texts)
 
-        def _fill(ordered: list[str], bank: dict, embed_fn, label: str) -> torch.Tensor:
-            """Gather embeddings for ``ordered`` — cache hits from ``bank``,
-            misses embedded once and added back into the bank."""
-            missing = [t for t in ordered if t not in bank]
-            n_hit = len(ordered) - len(missing)
-            if missing:
+        def _fill(
+            ordered: list[str],
+            g_emb: Optional[torch.Tensor],
+            g_t2i: dict[str, int],
+            embed_fn,
+            label: str,
+        ) -> torch.Tensor:
+            """Gather embeddings for ``ordered``.
+
+            Cache hits are copied from the contiguous global tensor ``g_emb``
+            with a chunked ``index_select`` (bounded transient memory); only the
+            texts absent from ``g_t2i`` are sent to ``embed_fn``.  This avoids
+            materialising a per-text dict or a giant Python list + ``torch.stack``
+            (which previously OOM-killed multi-million-text runs).
+            """
+            n = len(ordered)
+            # Map each ordered position to its global row (or record as missing).
+            gidx = torch.full((n,), -1, dtype=torch.long)
+            miss_pos: list[int] = []
+            miss_txt: list[str] = []
+            for p, t in enumerate(ordered):
+                j = g_t2i.get(t, -1) if g_t2i else -1
+                if j >= 0:
+                    gidx[p] = j
+                else:
+                    miss_pos.append(p)
+                    miss_txt.append(t)
+            n_hit = n - len(miss_txt)
+
+            # Embed the (usually small) missing set in batches.
+            miss_emb: Optional[torch.Tensor] = None
+            if miss_txt:
                 print(
-                    f"[CTA][SMP][embed] {len(missing)}/{len(ordered)} {label} "
+                    f"[CTA][SMP][embed] {len(miss_txt)}/{n} {label} "
                     f"not in cache — embedding …",
                     flush=True,
                 )
                 bs = max(1, int(getattr(self._embedder, "batch_size", 64) or 64))
+                chunks: list[torch.Tensor] = []
                 for s in tqdm(
-                    range(0, len(missing), bs),
+                    range(0, len(miss_txt), bs),
                     desc=f"[CTA][SMP][embed] {label}",
                     unit="batch",
-                    total=(len(missing) + bs - 1) // bs,
+                    total=(len(miss_txt) + bs - 1) // bs,
                 ):
-                    chunk = missing[s : s + bs]
-                    vecs = embed_fn(chunk)
-                    for t, v in zip(chunk, vecs):
-                        bank[t] = torch.as_tensor(v, dtype=torch.float32)
+                    vecs = embed_fn(miss_txt[s : s + bs])
+                    chunks.append(
+                        torch.stack([torch.as_tensor(v, dtype=torch.float32) for v in vecs])
+                    )
+                miss_emb = torch.cat(chunks, dim=0) if chunks else None
             elif ordered:
                 print(
-                    f"[CTA][SMP][embed] all {len(ordered)} {label} served from cache",
+                    f"[CTA][SMP][embed] all {n} {label} served from cache",
                     flush=True,
                 )
-            out = torch.stack(
-                [torch.as_tensor(bank[t], dtype=torch.float32) for t in ordered]
-            )
+
+            # Determine embedding dimension.
+            if g_emb is not None and n_hit > 0:
+                d = int(g_emb.shape[1])
+            elif miss_emb is not None:
+                d = int(miss_emb.shape[1])
+            else:
+                return torch.empty((0, 0), dtype=torch.float32)
+
+            out = torch.empty((n, d), dtype=torch.float32)
+
+            # Copy cache hits in bounded chunks so the index_select temporary
+            # never grows to the full [n, d] size.
+            if g_emb is not None and n_hit > 0:
+                CH = 100_000
+                for s in range(0, n, CH):
+                    e = min(n, s + CH)
+                    sub = gidx[s:e]
+                    present = sub >= 0
+                    if bool(present.any()):
+                        out[s:e][present] = g_emb.index_select(
+                            0, sub[present]
+                        ).to(torch.float32)
+
+            # Scatter the freshly embedded misses into their positions.
+            if miss_emb is not None:
+                # Freshly embedded vectors come straight from the model and may
+                # be wider than the (possibly already-truncated) cache dim ``d``
+                # taken from ``g_emb``.  Shrink them to ``d`` so they align with
+                # ``out`` before the scatter (mirrors the embed_dim truncation
+                # applied to the rest of the pipeline).
+                if miss_emb.shape[1] > d:
+                    miss_emb = miss_emb[:, :d]
+                out[torch.tensor(miss_pos, dtype=torch.long)] = miss_emb
+
             norms = out.norm(dim=1)
             print(
-                f"[CTA][SMP][embed][stat] {label}: total={len(ordered)} "
-                f"cache_hit={n_hit} embedded={len(missing)} "
+                f"[CTA][SMP][embed][stat] {label}: total={n} "
+                f"cache_hit={n_hit} embedded={len(miss_txt)} "
                 f"shape={tuple(out.shape)} "
                 f"norm[min/mean/max]="
                 f"{norms.min():.3f}/{norms.mean():.3f}/{norms.max():.3f}",
@@ -793,11 +905,15 @@ class CTASMPDataset(Dataset):
             )
             return out
 
-        self._doc_embed_cache = _fill(ordered_doc, doc_bank, _doc_embed_fn, "documents")
+        self._doc_embed_cache = _fill(
+            ordered_doc, g_doc_emb, g_doc_t2i, _doc_embed_fn, "documents"
+        )
         self._qry_embed_cache = (
-            _fill(ordered_query, qry_bank, _qry_embed_fn, "queries")
+            _fill(ordered_query, g_qry_emb, g_qry_t2i, _qry_embed_fn, "queries")
             if include_query else None
         )
+        # Release the large global tensors now that gathering is done.
+        del g_doc_emb, g_qry_emb
 
         self._embed_dim = int(self._doc_embed_cache.shape[1])
 
@@ -834,25 +950,31 @@ class CTASMPDataset(Dataset):
                 flush=True,
             )
 
-        smp_rows, qry_rows, qry_bar_rows = [], [], []
-        for _, up in self._samples:
-            smp_rows.append([
-                doc_text_to_idx[up.col_header_a],
-                doc_text_to_idx[up.cell_value_a],
-                doc_text_to_idx[up.cell_value_b],
-                doc_text_to_idx[up.col_header_b],
-            ])
+        # Build the index tensors into pre-allocated arrays.  Using a Python
+        # list-of-lists + torch.tensor(...) would hold both the (huge) nested
+        # list and the resulting tensor at once, doubling peak memory; writing
+        # straight into numpy int64 arrays and wrapping them zero-copy avoids
+        # that transient.
+        N = len(self._samples)
+        smp_arr = np.empty((N, 4), dtype=np.int64)
+        qry_arr = np.empty(N, dtype=np.int64) if include_query else None
+        qry_bar_arr = np.empty(N, dtype=np.int64) if include_query else None
+        for i, (_, up) in enumerate(self._samples):
+            smp_arr[i, 0] = doc_text_to_idx[up.col_header_a]
+            smp_arr[i, 1] = doc_text_to_idx[up.cell_value_a]
+            smp_arr[i, 2] = doc_text_to_idx[up.cell_value_b]
+            smp_arr[i, 3] = doc_text_to_idx[up.col_header_b]
             if include_query:
                 fmt = dict(
                     pivot_a=up.col_header_a, node_a=up.cell_value_a,
                     node_b=up.cell_value_b, pivot_b=up.col_header_b,
                 )
-                qry_rows.append(query_text_to_idx[self._cat_qry_tmpl.format(**fmt)])
-                qry_bar_rows.append(query_text_to_idx[self._cat_qry_bar_tmpl.format(**fmt)])
+                qry_arr[i]     = query_text_to_idx[self._cat_qry_tmpl.format(**fmt)]
+                qry_bar_arr[i] = query_text_to_idx[self._cat_qry_bar_tmpl.format(**fmt)]
 
-        self._smp_idx = torch.tensor(smp_rows, dtype=torch.long)
-        self._qry_cat_idx = torch.tensor(qry_rows, dtype=torch.long) if include_query else None
-        self._qry_bar_cat_idx = torch.tensor(qry_bar_rows, dtype=torch.long) if include_query else None
+        self._smp_idx = torch.from_numpy(smp_arr)
+        self._qry_cat_idx = torch.from_numpy(qry_arr) if include_query else None
+        self._qry_bar_cat_idx = torch.from_numpy(qry_bar_arr) if include_query else None
 
         # Skip writing the per-split cache when the global cache is in use —
         # the merged global_{model}_smp.embed_cache.pt is the single source.

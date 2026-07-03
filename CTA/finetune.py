@@ -570,17 +570,45 @@ def main(cfg: DictConfig) -> float:
     # ── Pretrained encoder (optional) ─────────────────────────────────────────
     pretrained_ckpt = OmegaConf.select(cfg, "finetuning.pretrained_ckpt")
     pretrain_cfg = cfg  # default: use current config
-    
+
     if pretrained_ckpt:
-        # If pretrained_ckpt is a directory, auto-resolve to last.ckpt and load pretrain config
+        # Resolve the checkpoint file and its sibling run_config.yaml.
+        # A directory → last.ckpt inside it; a file → run_config.yaml alongside.
         ckpt_path = Path(pretrained_ckpt)
         if ckpt_path.is_dir():
             pretrain_run_cfg = ckpt_path / "run_config.yaml"
-            if pretrain_run_cfg.exists():
-                pretrain_cfg = OmegaConf.load(str(pretrain_run_cfg))
-                print(f"[CTA][finetune] loaded pretraining config from {pretrain_run_cfg}")
             pretrained_ckpt = str(ckpt_path / "last.ckpt")
             print(f"[CTA][finetune] auto-resolved checkpoint folder to {pretrained_ckpt}")
+        else:
+            pretrain_run_cfg = ckpt_path.parent / "run_config.yaml"
+
+        if pretrain_run_cfg.exists():
+            pretrain_cfg = OmegaConf.load(str(pretrain_run_cfg))
+            print(f"[CTA][finetune] loaded pretraining config from {pretrain_run_cfg}")
+
+            # The pretrained encoder architecture is fixed by the checkpoint, so
+            # its model config OVERRIDES any model.* passed on the CLI / finetune
+            # config (e.g. model.num_layers=1 arg vs. 3 in the checkpoint).  We
+            # copy the whole pretrain model block into cfg so every downstream
+            # consumer stays consistent: the encoder build, the hparams
+            # encoder_config_dict used to rebuild the skeleton on reload, the
+            # cfg hash, and the re-saved run_config.yaml.
+            pretrain_model = OmegaConf.select(pretrain_cfg, "model")
+            if pretrain_model is not None:
+                with open_dict(cfg):
+                    for _k, _v in pretrain_model.items():
+                        _old = OmegaConf.select(cfg, f"model.{_k}")
+                        if _old != _v:
+                            print(
+                                f"[CTA][finetune] override model.{_k}: "
+                                f"{_old!r} → {_v!r} (from pretrain checkpoint)"
+                            )
+                        cfg.model[_k] = _v
+        else:
+            print(
+                f"[CTA][finetune] WARNING: no run_config.yaml found next to "
+                f"{pretrained_ckpt}; using model.* from the finetune config as-is"
+            )
     
     # ── Encoder setup ──────────────────────────────────────────────────────────
     # freeze_encoder=True  + pretrained_ckpt=null  → NO encoder (raw LLM embs → head)
@@ -828,6 +856,24 @@ def main(cfg: DictConfig) -> float:
 
     metrics: dict = {}
 
+    def _metric_dict(preds: torch.Tensor, target_int: torch.Tensor, thr: float) -> dict:
+        """Micro/macro accuracy, precision, recall, F1 via torchmetrics.
+
+        ``preds`` are binarised at ``thr`` — pass probabilities with the eval
+        threshold, or hard 0/1 vote predictions with thr=0.5.
+        """
+        d = {"accuracy": float(
+            MultilabelAccuracy(num_labels=num_classes, threshold=thr, average="micro")(preds, target_int)
+        )}
+        for avg in ("micro", "macro"):
+            d[f"precision_{avg}"] = float(
+                MultilabelPrecision(num_labels=num_classes, threshold=thr, average=avg)(preds, target_int))
+            d[f"recall_{avg}"] = float(
+                MultilabelRecall(num_labels=num_classes, threshold=thr, average=avg)(preds, target_int))
+            d[f"f1_{avg}"] = float(
+                MultilabelF1Score(num_labels=num_classes, threshold=thr, average=avg)(preds, target_int))
+        return d
+
     for split in ("dev", "test"):
         embs, multi_hot = splits[split].tensors
         col_ids = col_ids_map[split]
@@ -835,35 +881,57 @@ def main(cfg: DictConfig) -> float:
         with torch.no_grad():
             logits = best_model(embs.to(eval_device)).cpu()
 
-        # Soft majority voting in cell mode: average per-cell logits → column logit
-        if embed_mode == "cell":
-            unique_cols = torch.unique(col_ids)
-            logits    = torch.stack([logits[col_ids == c].mean(0)    for c in unique_cols])
-            multi_hot = torch.stack([multi_hot[col_ids == c][0]      for c in unique_cols])
-
-        probs      = torch.sigmoid(logits)
-        target_int = multi_hot.long()
-
         split_metrics: dict = {}
 
-        # Precision / Recall / F1 (micro & macro) via torchmetrics
-        split_metrics["accuracy"] = float(
-            MultilabelAccuracy(num_labels=num_classes, threshold=threshold, average="micro")
-            (probs, target_int)
-        )
-        for avg in ("micro", "macro"):
-            split_metrics[f"precision_{avg}"] = float(
-                MultilabelPrecision(num_labels=num_classes, threshold=threshold, average=avg)
-                (probs, target_int)
+        # Aggregate per-column via two voting schemes for every embed_mode.
+        # In 'column' mode each column is already a single row (unique col_id),
+        # so both votes reduce to plain thresholding; in 'cell'/'cell_header'
+        # mode a column has one row per U-path and the votes actually aggregate.
+        unique_cols = torch.unique(col_ids)
+        col_target  = torch.stack(
+            [multi_hot[col_ids == c][0] for c in unique_cols]
+        ).long()
+
+        # (1) Soft vote (current logic): mean per-cell logits → column logit,
+        #     then sigmoid + threshold.
+        col_logits = torch.stack([logits[col_ids == c].mean(0) for c in unique_cols])
+        soft_probs = torch.sigmoid(col_logits)
+        soft = _metric_dict(soft_probs, col_target, threshold)
+
+        # (2) Hard majority (plurality) vote over the FULL prediction vector:
+        #     threshold each cell first, then within each column count how many
+        #     cells produced each distinct binary pattern and keep the most
+        #     frequent whole pattern (e.g. [0,1,1,0] x2 vs [1,0,1,0] x1 → keep
+        #     [0,1,1,0]).  Ties on count are broken by the larger number of
+        #     predicted labels (max row sum); any remaining tie picks the first
+        #     such pattern deterministically.
+        cell_pred = (torch.sigmoid(logits) >= threshold).float()          # [n_cells, C] per-cell votes
+
+        def _plurality(group: torch.Tensor) -> torch.Tensor:
+            # group: [n_g, C] binary rows → winning [C] pattern
+            uniq, _, counts = torch.unique(
+                group, dim=0, return_inverse=True, return_counts=True
             )
-            split_metrics[f"recall_{avg}"] = float(
-                MultilabelRecall(num_labels=num_classes, threshold=threshold, average=avg)
-                (probs, target_int)
-            )
-            split_metrics[f"f1_{avg}"] = float(
-                MultilabelF1Score(num_labels=num_classes, threshold=threshold, average=avg)
-                (probs, target_int)
-            )
+            top  = counts.max()
+            cand = counts == top                                          # tied top-count rows
+            if int(cand.sum()) > 1:
+                sums = uniq.sum(dim=1)
+                sums = torch.where(cand, sums, sums.new_full(sums.shape, -1.0))
+                win  = int(sums.argmax())                                 # break tie by max #labels
+            else:
+                win  = int(counts.argmax())
+            return uniq[win]
+
+        hard_pred = torch.stack(
+            [_plurality(cell_pred[col_ids == c]) for c in unique_cols]
+        )                                                                  # [n_cols, C]
+        hard = _metric_dict(hard_pred, col_target, 0.5)
+
+        # Unprefixed keys = soft vote (backward-compat + Optuna objective);
+        # hard_* reports the majority-vote scheme alongside it.
+        split_metrics.update(soft)
+        split_metrics.update({f"hard_{k}": v for k, v in hard.items()})
+
         split_metrics["threshold"] = threshold
 
         out_file = eval_dir / f"cta_{split}_metrics.json"

@@ -1,0 +1,102 @@
+# TRL_Adhesive/config.yaml
+# Hyperparameters for TableEmbedJePA training on the complex / nested Adhesive tables.
+# Override any value on the command line, e.g.:
+#   python TRL_Adhesive/train.py training.epochs=30 model.num_layers=6
+
+# ── Hardware ──────────────────────────────────────────────────────────────
+matmul_precision: high
+
+# ── Model architecture ─────────────────────────────────────────────────────
+model:
+  hidden_size: 384         # transformer working dimension (embed_dim_out)
+  num_layers: 1
+  num_heads: 12            # must divide hidden_size; auto-adjusted if needed
+  intermediate_size: null  # null = hidden_size * 4
+  attention_dropout: 0.1
+  hidden_dropout: 0.1
+  layer_norm_eps: 1.0e-12
+  temperature: 0.07        # InfoNCE softmax temperature
+  beta: 0.5                # reserved contrastive weighting scalar
+  ema_decay: 0.996         # EMA decay rate for target encoder update
+  ablate_proj: true        # true = replace input_projection with (non-square) identity
+
+# ── Loss weights ────────────────────────────────────────────────────────────
+loss:
+  jepa: 1.0      # JEPA prediction loss  — predictor(node) ≈ target_enc(query)[CLS]
+  jepa_bar: 1.0  # JEPA bar loss (reversed SMP)
+  local: 1.0     # local InfoNCE — node ↔ {pivot_a, node, pivot_b}
+  global: 1.0    # global SMP InfoNCE — CLS[SMP[i]] ↔ CLS[SMP_bar[i]]
+
+# ── Data ───────────────────────────────────────────────────────────────────
+# data.dir must contain the sub-folders:
+#   AdhesiveTable_SMP_format/, AdhesiveTable_json_format/, QUESTIONS_ANSWERS_PER_TABLE/
+data:
+  dir: "D:\\TABLE_DATASET\\DATASET_ABOUT_ADHESIVE\\ReleasedTableDatasetAdhesive"
+  max_records: null         # null = load all question-records
+  unique_tables_only: true  # true = train on the first record per table (no duplicate tables)
+  upath_source: json        # walk = parse SMP .txt walk files; json = derive U-paths from table JSON structure alone
+
+# ── Embedder ────────────────────────────────────────────────────────────────
+embedder:
+  model_type: huggingface
+  base_url: http://134.184.22.126:10434/   # Ollama server (ignored for other backends)
+  model_name: sentence-transformers/all-MiniLM-L6-v2
+  api_key: null            # required for openai / huggingface Inference API backends
+  precompute: true         # batch-embed the whole dataset at init (recommended)
+  embed_batch_size: 64     # texts per embed call
+  embed_dim: null          # null = no cap, use the model's native embedding dim;
+                           # a set value truncates every embedding (embedding /
+                           # dataset creation / training) to the first N dims.
+  cache_embeddings: true   # save/reload .embed_cache.pt
+  embed_cache_dir: .cache  # null = store next to the dataset dir
+
+# ── Query templates ───────────────────────────────────────────────────────────
+# For complex tables a U-path is  header | node | header, so node_a == node_b.
+# Placeholders: {pivot_a}=row/left header  {pivot_b}=column/right header
+#               {node_a}={node_b}=the value node
+query:
+  cat_qry_template:     "{pivot_a} ... {pivot_b}?"
+  cat_qry_bar_template: "{pivot_b} ... {pivot_a}?"
+
+# ── HIT (High-informative Token) query filter ─────────────────────────────────
+# The HIT query variant keeps only the most informative question tokens: each
+# whitespace-split token is embedded and scored by cosine similarity to the full
+# question embedding, the per-question scores are min-max normalised to [0, 1],
+# and tokens scoring above the model-specific threshold are retained.
+hit:
+  # Per-embedder-model threshold on the min-max normalised token score (0..1).
+  # Values are computed empirically with compute_hit_threshold.py (Fig. 4 method).
+  thresholds:
+    sentence-transformers/all-MiniLM-L6-v2: 0.2636
+    nomic-embed-text: 0.30
+    sentence-transformers/all-mpnet-base-v2: 0.29
+  default_threshold: 0.5   # used when the active model_name is not listed above
+
+# ── SMP generation ──────────────────────────────────────────────────────────
+# The Adhesive SMP walks are pre-computed on disk; these flags are kept for
+# signature parity with TRL-model but have no effect here.
+smp:
+  use_graph_walks: false
+  num_walks: 50
+  chunk_size: 1
+
+# ── Training ───────────────────────────────────────────────────────────────
+training:
+  # mode: 'global'    — single model on all tables; saved to output_dir/
+  #        'per_table' — one model per table_id; saved to output_dir/<table_id>/
+  mode: global
+  output_dir: TRL_Adhesive/checkpoints
+  epochs: 50
+  batch_size: 128          # per-device; must be even (query-loss pairing)
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  max_grad_norm: 2.0
+  fp16: false
+  bf16: false
+  dataloader_num_workers: 4
+  logging_steps: 10
+  save_total_limit: 3
+  seed: 42
+  ckpt_path: null
+  early_stopping_patience: 0
+  early_stopping_min_delta: 1e-4

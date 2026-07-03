@@ -1,0 +1,60 @@
+# TRL_Adhesive/sweep_optuna.yaml
+# Hydra-Optuna sweep configuration for TableEmbedJePA.
+#
+# Usage (from repo root):
+#   python TRL_Adhesive/train.py --config-name sweep_optuna --multirun
+#   # or via the shell script:
+#   bash TRL_Adhesive/run_train.sh -s
+#
+# Hydra calls train() once per Optuna trial and uses the returned float
+# (MRR of the "both" search space, or −train_loss as fallback) as the
+# objective.  direction: maximize → higher MRR is better.
+#
+# Override n_trials or study settings from the CLI, e.g.:
+#   python TRL_Adhesive/train.py --config-name sweep_optuna --multirun \
+#       hydra.sweeper.n_trials=20 \
+#       hydra.sweeper.storage="sqlite:///TRL_Adhesive/optuna.db"
+
+defaults:
+  - config                        # inherit everything from config.yaml
+  - override hydra/sweeper: optuna
+
+hydra:
+  sweeper:
+    direction: maximize           # maximise MRR (train() must return the objective)
+    study_name: tablejepa_sweep
+    n_trials: 10
+    n_jobs: 1                     # set >1 only with a shared storage backend
+    storage: sqlite:///TRL_Adhesive/optuna.db                 # e.g. "sqlite:///TRL_Adhesive/optuna.db" for
+                                  # persistence across interrupted sweeps or parallel workers
+    sampler:
+      _target_: optuna.samplers.TPESampler
+      seed: 42
+
+    # ── Search space ──────────────────────────────────────────────────────────
+    # Syntax uses Hydra override grammar:
+    #   interval(low, high)            → uniform float
+    #   tag(log, interval(low, high))  → log-uniform float
+    #   range(low, high)               → uniform integer [low, high)
+    #   choice(a, b, c)                → categorical
+    params:
+      # Optimiser
+      training.lr:            tag(log, interval(1e-5, 1e-3))
+      training.weight_decay:  tag(log, interval(1e-4, 1e-1))
+
+      # Model capacity
+      model.num_layers:       range(2, 13)
+      model.hidden_size:      choice(256, 384, 512)
+
+      # InfoNCE temperature & EMA
+      model.temperature:      tag(log, interval(0.02, 0.20))
+      model.ema_decay:        interval(0.990, 0.999)
+
+      # batch size (uncomment to include in the search space)
+      training.batch_size:    choice(64, 128, 256)
+
+      # Loss weights (uncomment to include in the search space)
+      loss.jepa:    interval(0.5, 1.0)
+      loss.jepa_bar: choice(0.0, 1.0)
+      loss.local:   interval(0.0, 1.0)
+      loss.global:  interval(0.0, 1.0)

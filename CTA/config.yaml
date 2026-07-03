@@ -137,8 +137,8 @@ pretraining:
   lr: 1.0e-4
   weight_decay: 1.0e-2
   max_grad_norm: 2.0
-  fp16: true
-  bf16: false
+  fp16: false          # fp16 ("16-mixed") is unstable here → NaN loss
+  bf16: true           # bf16 has fp32's range; stable on Ampere+ GPUs
   dataloader_num_workers: 4
   logging_steps: 10
   save_total_limit: 3
