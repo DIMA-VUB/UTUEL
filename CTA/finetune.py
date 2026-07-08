@@ -49,6 +49,7 @@ import hydra
 import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
+from dotenv import load_dotenv
 from omegaconf import DictConfig, OmegaConf, open_dict
 from pytorch_lightning.callbacks import (
     EarlyStopping,
@@ -540,6 +541,8 @@ class CTAClassifier(pl.LightningModule):
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+# Load .env (e.g. OLLAMA_IP) so ${oc.env:...} interpolations resolve at config time.
+load_dotenv()
 
 @hydra.main(config_path=".", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> float:

@@ -194,7 +194,7 @@ def compute_query_shift(
     mu_sw, sd_sw = float(cos_sw.mean()), float(cos_sw.std())
     mu_hit, sd_hit = float(cos_hit.mean()), float(cos_hit.std())
 
-    slug = model_name.replace("/", "-").replace("\\", "-")
+    slug = model_name.replace("/", "-").replace("\\", "-").replace(":", "-")
     disp = model_name.split("/")[-1]
 
     C_RAW, C_SW, C_HIT = "tab:blue", "tab:orange", "tab:green"

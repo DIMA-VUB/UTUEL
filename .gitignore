@@ -5,6 +5,7 @@ __pycache__/
 *.pyo
 .env
 .*
+!.env.example
 datasets/*.jsonl
 results/
 datasets/**
@@ -27,6 +28,19 @@ __pycache__/
 *.jpeg
 *.svg
 *.pdf
+
+# Ignore all Jupyter notebooks
+*.ipynb
+
+# Allow image assets used in documentation
+!assets/
+!assets/**/
+!assets/**/*.png
+!assets/**/*.jpg
+!assets/**/*.jpeg
+!assets/**/*.svg
+!assets/**/*.pdf
+
 datasets_TRL/**
 CTA/checkpoints/**
 CTA/lightning_logs/**

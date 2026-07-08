@@ -58,7 +58,7 @@ class CTAClassifier(pl.LightningModule):
                 nn.LayerNorm(d, eps=config.layer_norm_eps),
                 nn.Linear(d, intermediate_size),
                 nn.GELU(),
-                nn.Dropout(getattr(config, "hidden_dropout_prob", 0.0)),
+                nn.Dropout(getattr(config, "hidden_dropout_prob", 0.5)),
                 nn.Linear(intermediate_size, config.num_classes),
             )
         else:

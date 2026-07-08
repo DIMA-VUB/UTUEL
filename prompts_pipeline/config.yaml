@@ -18,7 +18,7 @@ pipeline:
   # — no separate batch_size needed here.
   # No timeout: requests can queue for a long time under high load;
   # a hard deadline would turn valid slow responses into false errors.
-  ollama_base_url: http://localhost:11434
+  ollama_base_url: http://${oc.env:OLLAMA_IP,localhost}:11434
 
 # ── Datasets ─────────────────────────────────────────────────────────────────
 datasets:

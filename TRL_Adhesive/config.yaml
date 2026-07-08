@@ -22,8 +22,8 @@ model:
 
 # ── Loss weights ────────────────────────────────────────────────────────────
 loss:
-  jepa: 1.0      # JEPA prediction loss  — predictor(node) ≈ target_enc(query)[CLS]
-  jepa_bar: 1.0  # JEPA bar loss (reversed SMP)
+  jepa: 0.0      # JEPA prediction loss  — predictor(node) ≈ target_enc(query)[CLS]
+  jepa_bar: 0.0  # JEPA bar loss (reversed SMP)
   local: 1.0     # local InfoNCE — node ↔ {pivot_a, node, pivot_b}
   global: 1.0    # global SMP InfoNCE — CLS[SMP[i]] ↔ CLS[SMP_bar[i]]
 
@@ -39,7 +39,7 @@ data:
 # ── Embedder ────────────────────────────────────────────────────────────────
 embedder:
   model_type: huggingface
-  base_url: http://134.184.22.126:10434/   # Ollama server (ignored for other backends)
+  base_url: http://${oc.env:OLLAMA_IP,localhost}:10434/   # Ollama server (ignored for other backends)
   model_name: sentence-transformers/all-MiniLM-L6-v2
   api_key: null            # required for openai / huggingface Inference API backends
   precompute: true         # batch-embed the whole dataset at init (recommended)
@@ -68,8 +68,11 @@ hit:
   # Values are computed empirically with compute_hit_threshold.py (Fig. 4 method).
   thresholds:
     sentence-transformers/all-MiniLM-L6-v2: 0.2636
-    nomic-embed-text: 0.30
+    nomic-embed-text: 0.4595
     sentence-transformers/all-mpnet-base-v2: 0.29
+    embeddinggemma: 0.3703
+    qwen3-embedding:0.6b: 0.283
+    all-minilm: 0.2638
   default_threshold: 0.5   # used when the active model_name is not listed above
 
 # ── SMP generation ──────────────────────────────────────────────────────────
@@ -85,7 +88,7 @@ training:
   # mode: 'global'    — single model on all tables; saved to output_dir/
   #        'per_table' — one model per table_id; saved to output_dir/<table_id>/
   mode: global
-  output_dir: TRL_Adhesive/checkpoints
+  output_dir: "D:\\TABLE_DATASET\\DATASET_ABOUT_ADHESIVE\\OUTPUT_UTUEL\\TRL_Adhesive\\checkpoints"
   epochs: 50
   batch_size: 128          # per-device; must be even (query-loss pairing)
   lr: 1.0e-4

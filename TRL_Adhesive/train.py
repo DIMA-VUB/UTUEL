@@ -31,6 +31,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
+from dotenv import load_dotenv
 from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 
 # Allow `python TRL_Adhesive/train.py` from the repo root
@@ -571,6 +572,10 @@ def train(cfg: DictConfig) -> float:
     dm = TableEmbedJePADataModule(data_dir=data_dir, **_dm_kwargs)
     dm.setup()
     return _train_one(cfg, dm, out_dir=out_base, run_label="table-jepa")
+
+
+# Load .env (e.g. OLLAMA_IP) so ${oc.env:...} interpolations resolve at config time.
+load_dotenv()
 
 
 @hydra.main(config_path=".", config_name="config", version_base=None)

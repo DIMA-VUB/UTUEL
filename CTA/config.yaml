@@ -109,7 +109,7 @@ data:
 # Same backends as TRL-model: 'openai' | 'huggingface' | <Ollama model name>
 embedder:
   model_type: huggingface
-  base_url: http://127.0.0.1:11434/ # Ollama server (ignored for other backends)
+  base_url: http://${oc.env:OLLAMA_IP,localhost}:11434/ # Ollama server (ignored for other backends)
   model_name: sentence-transformers/all-MiniLM-L6-v2
   api_key: null
   precompute: true           # batch-embed all unique node texts at dataset init

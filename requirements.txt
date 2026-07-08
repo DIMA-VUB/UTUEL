@@ -22,8 +22,7 @@ langchain-huggingface==0.1.2   # HuggingFace Hub embeddings
 
 # ── Config / CLI ──────────────────────────────────────────────────────────────
 hydra-core==1.3.2
-omegaconf==2.3.0
-hydra-optuna-sweeper==1.2.0   # hydra --multirun with Optuna TPE/CMA-ES
+omegaconf==2.3.0python-dotenv>=1.0.0            # load .env for ${oc.env:...} interpolation (e.g. OLLAMA_IP)hydra-optuna-sweeper==1.2.0   # hydra --multirun with Optuna TPE/CMA-ES
 optuna==3.6.1                  # Bayesian hyperparameter optimisation
 
 # ── Graph-based SMP walks ─────────────────────────────────────────────────────

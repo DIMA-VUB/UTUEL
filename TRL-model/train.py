@@ -33,6 +33,7 @@ import pytorch_lightning as pl
 import torch
 import torch.nn.functional as F
 from omegaconf import DictConfig, OmegaConf
+from dotenv import load_dotenv
 from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, ModelCheckpoint
 
 # Allow `python TRL-model/train.py` from the repo root
@@ -806,6 +807,8 @@ def train(cfg: DictConfig) -> float:
 
 
 # ── Hydra entry point ─────────────────────────────────────────────────────────
+# Load .env (e.g. OLLAMA_IP) so ${oc.env:...} interpolations resolve at config time.
+load_dotenv()
 
 @hydra.main(config_path=".", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> float:

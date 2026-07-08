@@ -27,8 +27,10 @@ from pathlib import Path
 
 import numpy as np
 import yaml
+from dotenv import load_dotenv
+from omegaconf import OmegaConf
 
-# ── Path setup ────────────────────────────────────────────────────────────────
+# ── Path setup ─────────────────────────────────────────────────────────────────
 _HERE        = Path(__file__).resolve().parent        # table_retrieval/
 PROJECT_ROOT = _HERE.parent                            # repo root
 sys.path.insert(0, str(_HERE))                        # for embedder.py
@@ -328,9 +330,11 @@ def run_entry(
 
 
 def main(config_path: str | Path, model_filter: str | None = None, type_filter: str | None = None) -> None:
+    # Load .env so ${oc.env:VAR} interpolations (e.g. OLLAMA_IP) resolve.
+    load_dotenv()
     config_path = Path(config_path)
-    with config_path.open(encoding="utf-8") as f:
-        cfg = yaml.safe_load(f)
+    # OmegaConf.load resolves ${oc.env:...} interpolations; to_container returns a plain dict.
+    cfg = OmegaConf.to_container(OmegaConf.load(config_path), resolve=True)
 
     retrieval_cfg = cfg.get("retrieval", {})
     output_dir    = PROJECT_ROOT / cfg.get("output_dir", "table_retrieval/results")

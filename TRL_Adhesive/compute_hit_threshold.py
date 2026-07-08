@@ -201,7 +201,7 @@ def compute_hit_threshold(
     p1_lt = float(norm.cdf(thr, m1, s1))          # P(L=1 | alpha < thr)
     p1_gt = 1.0 - p1_lt
 
-    slug = model_name.replace("/", "-").replace("\\", "-")
+    slug = model_name.replace("/", "-").replace("\\", "-").replace(":", "-")
 
     # ── Plot (Fig. 4 style) ────────────────────────────────────────────────
     xs = np.linspace(0.0, 1.0, 1000)

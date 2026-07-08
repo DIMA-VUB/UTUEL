@@ -36,6 +36,7 @@ from pathlib import Path
 import hydra
 import pytorch_lightning as pl
 import torch
+from dotenv import load_dotenv
 from omegaconf import DictConfig, OmegaConf, open_dict
 from pytorch_lightning.callbacks import (
     EarlyStopping,
@@ -127,6 +128,8 @@ def build_model(cfg: DictConfig, embed_dim_in: int) -> TableEmbedJePA:
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
+# Load .env (e.g. OLLAMA_IP) so ${oc.env:...} interpolations resolve at config time.
+load_dotenv()
 
 @hydra.main(config_path=".", config_name="config", version_base=None)
 def main(cfg: DictConfig) -> float:

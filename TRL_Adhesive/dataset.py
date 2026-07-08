@@ -71,7 +71,7 @@ QA_SUBDIR   = "QUESTIONS_ANSWERS_PER_TABLE"
 
 def get_embedder(
     model_type: str = "llama3",
-    base_url: Optional[str] = "http://134.184.22.126:10434/",
+    base_url: Optional[str] = "http://localhost:10434/",
     model_name: Optional[str] = None,
     api_key: Optional[str] = None,
 ):
@@ -139,7 +139,7 @@ class TableEmbedJePADataset(Dataset):
         self,
         data_dir: str | Path,
         model_type: str = "huggingface",
-        base_url: Optional[str] = "http://134.184.22.126:10434/",
+        base_url: Optional[str] = "http://localhost:10434/",
         model_name: Optional[str] = None,
         api_key: Optional[str] = None,
         max_records: Optional[int] = None,
@@ -703,7 +703,7 @@ class TableEmbedJePADataModule(pl.LightningDataModule):
         batch_size: int = 8,
         num_workers: int = 0,
         model_type: str = "huggingface",
-        base_url: Optional[str] = "http://134.184.22.126:10434/",
+        base_url: Optional[str] = "http://localhost:10434/",
         model_name: Optional[str] = None,
         api_key: Optional[str] = None,
         max_records: Optional[int] = None,

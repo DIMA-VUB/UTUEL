@@ -41,7 +41,7 @@ data:
 # model_type: 'openai' | 'huggingface' | <any Ollama model name>
 embedder:
   model_type: huggingface #ollama
-  base_url: http://134.184.22.126:10434/   # Ollama server (ignored for other backends)
+  base_url: http://${oc.env:OLLAMA_IP,localhost}:10434/   # Ollama server (ignored for other backends)
   model_name: sentence-transformers/all-MiniLM-L6-v2 #qwen3-embedding:0.6b #sentence-transformers/all-MiniLM-L6-v2        # overrides HuggingFace Hub model name
   api_key: null           # required for openai / huggingface backends
   precompute: true        # batch-embed the whole dataset at init (recommended)

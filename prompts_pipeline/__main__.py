@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 
 import hydra
+from dotenv import load_dotenv
 from omegaconf import DictConfig
 
 from .runner import PipelineRunner, DatasetConfig
@@ -22,6 +23,9 @@ from .runner import PipelineRunner, DatasetConfig
 # the pipeline's own progress lines appear in the terminal.
 for _noisy in ("httpx", "httpcore", "langchain", "langchain_core", "ollama"):
     logging.getLogger(_noisy).setLevel(logging.WARNING)
+
+# Load .env (e.g. OLLAMA_IP) so ${oc.env:...} interpolations resolve at config time.
+load_dotenv()
 
 @hydra.main(config_path=str(Path(__file__).parent), config_name="config", version_base=None)
 def main(cfg: DictConfig) -> None:

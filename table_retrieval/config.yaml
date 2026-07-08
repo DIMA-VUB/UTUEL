@@ -54,7 +54,7 @@ datasets:
   #   path: datasets/test_lookup_WikiSQL.jsonl
   #   embedder:
   #     type: ollama
-  #     base_url: http://134.184.22.126:10434
+  #     base_url: http://${oc.env:OLLAMA_IP,localhost}:10434
   #     model_name: nomic-embed-text
   #     batch_size: 1
   #     # max_chars: auto   # omit or set to "auto" to detect from /api/show
@@ -64,7 +64,7 @@ datasets:
   #   path: datasets/test_lookup_WikiSQL.jsonl
   #   embedder:
   #     type: ollama
-  #     base_url: http://134.184.22.126:10434
+  #     base_url: http://${oc.env:OLLAMA_IP,localhost}:10434
   #     model_name: all-minilm
   #     batch_size: 1
   #     # max_chars: auto   # omit or set to "auto" to detect from /api/show
