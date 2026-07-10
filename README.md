@@ -600,9 +600,9 @@ Output goes to `datasets/MyDataset/llama3/run1.jsonl` and `datasets/MyDataset/ge
 If you use UTUEL in your research, please cite it:
 
 ```bibtex
-@software{utuel,
+@article{utuel,
   title        = {UTUEL: Unified Table Understanding via Context-aware Cell Embedding Learning},
-  author       = {willy Carlos Tchuitcheu, Tan Lu, Arthur Vanbeersel, Jordan Jeroen, ann Dooms},
+  author       = {Willy Carlos Tchuitcheu, Tan Lu, Arthur Van Beersel, Jeroen Jordens, Ann Dooms},
   year         = {2026},
   url          = {https://github.com/DIMA-VUB/UTUEL},
   organization = {Vrije Universiteit Brussel}
