@@ -14,7 +14,7 @@ Table Cell Retrieval, and Column Type Annotation.
 ![UTUEL overview: SMP U-path linearization, frozen LLM embedder, TRL-JEPA encoder with global, local, and SMP-induced query losses, feeding downstream table understanding tasks](assets/utuel_overview.png)
 
 ## News
-- **29-08-2026**: Accepted at IEEE Transaction on Knowledge and Data Engineering (TKDE).
+- **29-08-2026**: Accepted for publication in IEEE Transactions on Knowledge and Data Engineering (TKDE).
 - **08-07-2026**: First release of UTUEL.
 
 UTUEL bundles five related tasks for table understanding research:
