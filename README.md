@@ -14,8 +14,8 @@ Table Cell Retrieval, and Column Type Annotation.
 ![UTUEL overview: SMP U-path linearization, frozen LLM embedder, TRL-JEPA encoder with global, local, and SMP-induced query losses, feeding downstream table understanding tasks](assets/utuel_overview.png)
 
 ## News
-
-- **2026-07-08**: First release of UTUEL.
+- **29-08-2026**: Accepted at IEEE Transaction on Knowledge and Data Engineering (TKDE).
+- **08-07-2026**: First release of UTUEL.
 
 UTUEL bundles five related tasks for table understanding research:
 
@@ -617,4 +617,4 @@ Maintained by the DIMA group at Vrije Universiteit Brussel.
 
 - Repository: https://github.com/DIMA-VUB/UTUEL
 - Issues and questions: please open an issue on the GitHub repository.
-- Email: willy.carlos.tchuitcheu@vub.be
+- Email: willy.carlos.tchuitcheu@vub.be, tchuitcheuwillycarlos@gmail.com
