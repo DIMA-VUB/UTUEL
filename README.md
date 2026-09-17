@@ -14,8 +14,8 @@ Table Cell Retrieval, and Column Type Annotation.
 ![UTUEL overview: SMP U-path linearization, frozen LLM embedder, TRL-JEPA encoder with global, local, and SMP-induced query losses, feeding downstream table understanding tasks](assets/utuel_overview.png)
 
 ## News
-
-- **2026-07-08**: First release of UTUEL.
+- **29-08-2026**: Accepted for publication in IEEE Transactions on Knowledge and Data Engineering (TKDE).
+- **08-07-2026**: First release of UTUEL.
 
 UTUEL bundles five related tasks for table understanding research:
 
@@ -600,13 +600,16 @@ Output goes to `datasets/MyDataset/llama3/run1.jsonl` and `datasets/MyDataset/ge
 If you use UTUEL in your research, please cite it:
 
 ```bibtex
-@software{utuel,
-  title        = {UTUEL: Unified Table Understanding via Context-aware Cell Embedding Learning},
-  author       = {willy Carlos Tchuitcheu, Tan Lu, Arthur Vanbeersel, Jordan Jeroen, ann Dooms},
-  year         = {2026},
-  url          = {https://github.com/DIMA-VUB/UTUEL},
-  organization = {Vrije Universiteit Brussel}
-}
+@ARTICLE{11682759,
+  author={Tchuitcheu, Willy Carlos and Lu, Tan and Van Beersel, Arthur and Jordens, Jeroen and Dooms, Ann},
+  journal={IEEE Transactions on Knowledge and Data Engineering}, 
+  title={Unified Table Understanding Via Context-Aware Cell Embedding Learning}, 
+  year={2026},
+  volume={},
+  number={},
+  pages={1-13},
+  keywords={Cells (biology);Modeling;Licenses;Training;Large language models;Conferences;Learning (artificial intelligence);Context;Nuclear facility regulation;Weighted sum model;Joint-Embedding predictive architecture;self-supervised learning;table embedder;table representation learning;table understanding},
+  doi={10.1109/TKDE.2026.3731233}}
 ```
 
 ---
@@ -617,4 +620,4 @@ Maintained by the DIMA group at Vrije Universiteit Brussel.
 
 - Repository: https://github.com/DIMA-VUB/UTUEL
 - Issues and questions: please open an issue on the GitHub repository.
-- Email: willy.carlos.tchuitcheu@vub.be
+- Email: willy.carlos.tchuitcheu@vub.be, tchuitcheuwillycarlos@gmail.com
