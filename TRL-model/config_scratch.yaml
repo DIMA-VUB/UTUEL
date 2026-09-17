@@ -1,0 +1,84 @@
+# TRL-model/config_scratch.yaml
+# TableEmbedJePA with a learned token embedding table.
+
+version: tableEmbedJepa-scratch
+matmul_precision: high
+
+# ── Model architecture ─────────────────────────────────────────────────────
+model:
+  hidden_size: 768
+  num_layers: 1
+  num_heads: 12
+  intermediate_size: null
+  attention_dropout: 0.1
+  hidden_dropout: 0.1
+  layer_norm_eps: 1.0e-12
+  temperature: 0.07
+  beta: 0.5
+  ema_decay: 0.996
+  ablate_proj: false
+
+# ── Loss weights ────────────────────────────────────────────────────────────
+loss:
+  jepa: 1.0
+  jepa_bar: 1.0
+  local: 1.0
+  global: 1.0
+
+# ── Data ───────────────────────────────────────────────────────────────────
+data:
+  path: "D:\\TABLE_DATASET\\WIKI_TABLE_SQL\\test_lookup_test_jepa_arch.jsonl"
+  max_records: null
+  unique_tables_only: true
+
+# ── Embedder ────────────────────────────────────────────────────────────────
+# `scratch` learns nn.Embedding weights jointly with the JEPA model. Its token
+# table is initialized from BERT below, then remains trainable. Set
+# `embedding_init: random` to initialize the table randomly instead.
+embedder:
+  model_type: scratch
+  model_name: null
+  tokenizer: bert-base-uncased
+  embedding_init: pretrained
+  pretrained_model_name: bert-base-uncased
+  # embedding_init: random
+  # pretrained_model_name: null
+
+  max_cell_tokens: 64
+  embed_dim: 768
+  base_url: null
+  api_key: null
+  precompute: false
+  embed_batch_size: 64
+  cache_embeddings: false
+  embed_cache_dir: null
+
+# ── Query templates ─────────────────────────────────────────────────────────
+query:
+  cat_qry_template: "{pivot_b} ... {pivot_a}({node_a})?"
+  cat_qry_bar_template: "{pivot_a} ... {pivot_b}({node_b})?"
+
+# ── SMP generation ──────────────────────────────────────────────────────────
+smp:
+  use_graph_walks: false
+  num_walks: 50
+  chunk_size: 1
+
+# ── Training ────────────────────────────────────────────────────────────────
+training:
+  mode: global
+  output_dir: TRL-model/checkpoints
+  epochs: 50
+  batch_size: 128
+  lr: 1.0e-4
+  weight_decay: 1.0e-2
+  max_grad_norm: 2.0
+  fp16: false
+  bf16: false
+  dataloader_num_workers: 4
+  logging_steps: 10
+  save_total_limit: 3
+  seed: 42
+  ckpt_path: null
+  early_stopping_patience: 0
+  early_stopping_min_delta: 1.0e-4

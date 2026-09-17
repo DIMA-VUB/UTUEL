@@ -6,48 +6,56 @@ U-path sequence layout
 ----------------------
 Each U-path produces three sequences (pre-computed LLM node embeddings):
 
-  SMP     : [pivot_a, node_a, node_b, pivot_b]   — 4 nodes  [4, d]
-  SMP_bar : [pivot_b, node_b, node_a, pivot_a]   — reversed  [4, d]
-  Query   : [concat(pivot_a, node_b, pivot_b)]    — single concatenated LLM embed  [1, d]
+  SMP     : [pivot_a, node_a, node_b, pivot_b]   ï¿½ 4 nodes  [4, d]
+  SMP_bar : [pivot_b, node_b, node_a, pivot_a]   ï¿½ reversed  [4, d]
+  Query   : [concat(pivot_a, node_b, pivot_b)]    ï¿½ single concatenated LLM embed  [1, d]
 
 The model prepends a learnable CLS token at runtime, making sequences of
 length 5 (SMP / SMP_bar) and 4 (query).
 
 Batch layout
 ------------
-  smp_embeds          [B, 4, d]   — SMP node embeddings
-  smp_bar_embeds      [B, 4, d]   — SMP_bar node embeddings (reversed)
-  query_embeds        [B, 1, d]   — single concatenated context query embedding
-  MASK_SMP_LEVEL_LOSS [2B, 2B]    — positive-pair mask for global SMP loss
+  smp_embeds          [B, 4, d]   ï¿½ SMP node embeddings
+  smp_bar_embeds      [B, 4, d]   ï¿½ SMP_bar node embeddings (reversed)
+  query_embeds        [B, 1, d]   ï¿½ single concatenated context query embedding
+  MASK_SMP_LEVEL_LOSS [2B, 2B]    ï¿½ positive-pair mask for global SMP loss
                                     1 = positive (SMP[i] <-> SMP_bar[i])
                                     0 = negative
                                     4 = diagonal (self, ignored)
-  question_embeds     [B, d]      — question embedding (for evaluation)
-  record_indices      [B]         — index into self.records
+  question_embeds     [B, d]      ï¿½ question embedding (for evaluation)
+  record_indices      [B]         ï¿½ index into self.records
 
 Embedder backends
 -----------------
   get_embedder() returns a LangChain embedder:
-    - Ollama  (default)  — any model served by a local Ollama instance
-    - OpenAI             — text-embedding-3-large
-    - HuggingFace Hub    — sentence-transformers/all-mpnet-base-v2
+    - Ollama  (default)  ï¿½ any model served by a local Ollama instance
+    - OpenAI             ï¿½ text-embedding-3-large
+    - HuggingFace Hub    ï¿½ sentence-transformers/all-mpnet-base-v2
 """
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import requests
+import sys
 from pathlib import Path
 from typing import Optional, Union
 
 import pytorch_lightning as pl
 import torch
 from torch.utils.data import DataLoader, Dataset, SubsetRandomSampler
+from transformers import AutoTokenizer
 
-try:
-    from .smp import UPath, generate_u_paths_flat, generate_u_paths_from_graph
-except ImportError:
-    from smp import UPath, generate_u_paths_flat, generate_u_paths_from_graph
+_SMP_SPEC = importlib.util.spec_from_file_location("trl_model_smp", Path(__file__).with_name("smp.py"))
+if _SMP_SPEC is None or _SMP_SPEC.loader is None:
+    raise ImportError("Cannot load the local smp.py module.")
+_SMP_MODULE = importlib.util.module_from_spec(_SMP_SPEC)
+sys.modules[_SMP_SPEC.name] = _SMP_MODULE
+_SMP_SPEC.loader.exec_module(_SMP_MODULE)
+UPath = _SMP_MODULE.UPath
+generate_u_paths_flat = _SMP_MODULE.generate_u_paths_flat
+generate_u_paths_from_graph = _SMP_MODULE.generate_u_paths_from_graph
 
 SMP_NODE_LEN = 4   # pivot_a, node_a, node_b, pivot_b
 QRY_NODE_LEN = 1   # concat(pivot_a, node_b, pivot_b) ? single LLM embedding
@@ -127,6 +135,9 @@ class TableEmbedJePADataset(Dataset):
         embed_cache_dir: Optional[Union[str, Path]] = None,
         cat_qry_template: str = "what is {pivot_a} of {node_b}({pivot_b})?",
         cat_qry_bar_template: str = "what is {pivot_b} of {node_a}({pivot_a})?",
+        tokenizer_name: Optional[str] = None,
+        max_cell_tokens: int = 32,
+        token_embed_dim: Optional[int] = None,
     ) -> None:
         # -- Load records ------------------------------------------------------
         # Always loads ALL records; unique_tables_only is a DataModule concern
@@ -151,7 +162,7 @@ class TableEmbedJePADataset(Dataset):
         self._base_url   = (base_url or "").rstrip("/")
         self._model_name = model_name
         self._api_key    = api_key
-        # HuggingFace backend uses direct REST / sentence_transformers — no LangChain needed.
+        # HuggingFace backend uses direct REST / sentence_transformers ï¿½ no LangChain needed.
         # _embedder is only used for Ollama/OpenAI single-query calls (embed_query).
         _tag = model_type.strip().lower()
         self._embedder = (
@@ -169,6 +180,11 @@ class TableEmbedJePADataset(Dataset):
         self._embed_cache_dir  = Path(embed_cache_dir) if embed_cache_dir else None
         self._cat_qry_template     = cat_qry_template
         self._cat_qry_bar_template = cat_qry_bar_template
+        self._tokenizer = AutoTokenizer.from_pretrained(tokenizer_name) if tokenizer_name else None
+        self._max_cell_tokens = max_cell_tokens
+        self._token_embed_dim = token_embed_dim
+        if self._tokenizer is not None and token_embed_dim is None:
+            raise ValueError("token_embed_dim is required when tokenizer_name is set.")
 
         # -- Generate U-paths per record ---------------------------------------
         _gen = (
@@ -219,39 +235,96 @@ class TableEmbedJePADataset(Dataset):
         self._embed_cache: Optional[torch.Tensor] = None
         self._text_to_idx: Optional[dict] = None
         self._question_cache: Optional[torch.Tensor] = None
+        self._smp_input_ids: Optional[torch.Tensor] = None
+        self._smp_attention_mask: Optional[torch.Tensor] = None
+        self._query_input_ids: Optional[torch.Tensor] = None
+        self._query_attention_mask: Optional[torch.Tensor] = None
+        self._query_bar_input_ids: Optional[torch.Tensor] = None
+        self._query_bar_attention_mask: Optional[torch.Tensor] = None
+        self._question_input_ids: Optional[torch.Tensor] = None
+        self._question_attention_mask: Optional[torch.Tensor] = None
 
         # Pre-built integer index tensors for O(1) tensor-slice __getitem__.
         # Built during _precompute_embeddings; None in live-embed mode.
         self._smp_idx:         Optional[torch.Tensor] = None   # [N, 4]
-        self._qry_cat_idx:     Optional[torch.Tensor] = None   # [N]  — index into _embed_cache for concat query (SMP)
-        self._qry_bar_cat_idx: Optional[torch.Tensor] = None   # [N]  — index into _embed_cache for concat query (SMP_bar)
+        self._qry_cat_idx:     Optional[torch.Tensor] = None   # [N]  ï¿½ index into _embed_cache for concat query (SMP)
+        self._qry_bar_cat_idx: Optional[torch.Tensor] = None   # [N]  ï¿½ index into _embed_cache for concat query (SMP_bar)
         self._rec_idx:         Optional[torch.Tensor] = None   # [N]
 
-        if precompute:
+        if self._tokenizer is not None:
+            self._precompute_tokens()
+        elif precompute:
             self._precompute_embeddings(embed_batch_size)
 
     # -- Embedding helpers -----------------------------------------------------
 
     @property
     def embed_dim(self) -> int:
+        if self._tokenizer is not None:
+            return int(self._token_embed_dim)
         if self._embed_dim is None:
             if self._embedder is not None:
                 self._embed_dim = len(self._embedder.embed_query("probe"))
             else:
-                # HuggingFace path — derive dim from one live embed
+                # HuggingFace path ï¿½ derive dim from one live embed
                 self._embed_dim = len(self._embed_batch_chunk(["probe"])[0])
         return self._embed_dim
+
+    def _serialize_queries(self, upath: UPath) -> tuple[str, str]:
+        fields = dict(
+            pivot_a=upath.col_header_a,
+            node_a=upath.cell_value_a,
+            node_b=upath.cell_value_b,
+            pivot_b=upath.col_header_b,
+        )
+        return (
+            self._cat_qry_template.format(**fields),
+            self._cat_qry_bar_template.format(**fields),
+        )
+
+    def _tokenize(self, texts: list[str]) -> tuple[torch.Tensor, torch.Tensor]:
+        encoded = self._tokenizer(
+            texts,
+            padding="max_length",
+            truncation=True,
+            max_length=self._max_cell_tokens,
+            return_tensors="pt",
+        )
+        return encoded["input_ids"], encoded["attention_mask"]
+
+    def _precompute_tokens(self) -> None:
+        smp_texts: list[list[str]] = []
+        query_texts: list[str] = []
+        query_bar_texts: list[str] = []
+        for _, upath in self._samples:
+            smp_texts.append([
+                upath.col_header_a, upath.cell_value_a,
+                upath.cell_value_b, upath.col_header_b,
+            ])
+            query_text, query_bar_text = self._serialize_queries(upath)
+            query_texts.append(query_text)
+            query_bar_texts.append(query_bar_text)
+
+        flat_ids, flat_mask = self._tokenize([text for row in smp_texts for text in row])
+        n_samples = len(self._samples)
+        self._smp_input_ids = flat_ids.view(n_samples, SMP_NODE_LEN, -1)
+        self._smp_attention_mask = flat_mask.view(n_samples, SMP_NODE_LEN, -1)
+        self._query_input_ids, self._query_attention_mask = self._tokenize(query_texts)
+        self._query_bar_input_ids, self._query_bar_attention_mask = self._tokenize(query_bar_texts)
+        questions = [rec.get("question", "") for rec in self.records]
+        self._question_input_ids, self._question_attention_mask = self._tokenize(questions)
+        print(f"[dataset][tokenize] {n_samples} samples, max_cell_tokens={self._max_cell_tokens}")
 
     def _embed_batch_chunk(self, texts: list[str]) -> list[list[float]]:
         """
         Embed one chunk via the backend's native batch API.
 
-        Ollama       — POST /api/embed  ``{input: [...]}``
+        Ollama       ï¿½ POST /api/embed  ``{input: [...]}``
                         Each string is tokenised and encoded independently.
-        HuggingFace  — with api_key: POST to HF Inference API
+        HuggingFace  ï¿½ with api_key: POST to HF Inference API
                         ``/pipeline/feature-extraction/{model}``
-                      — without api_key: local sentence_transformers.encode()
-        OpenAI       — LangChain (their SDK already batches independently).
+                      ï¿½ without api_key: local sentence_transformers.encode()
+        OpenAI       ï¿½ LangChain (their SDK already batches independently).
         """
         tag = self._model_type.strip().lower()
 
@@ -308,11 +381,11 @@ class TableEmbedJePADataset(Dataset):
 
         Memory layout after this call
         -----------------------------
-        _embed_cache     [N_unique, d]  — one row per *unique* node/query text
-        _question_cache  [R, d]         — one row per record question
-        _smp_idx         [N, 4]  long   — row indices into _embed_cache
-        _qry_cat_idx     [N]     long   — row index for concatenated query text
-        _rec_idx         [N]     long   — row indices into _question_cache
+        _embed_cache     [N_unique, d]  ï¿½ one row per *unique* node/query text
+        _question_cache  [R, d]         ï¿½ one row per record question
+        _smp_idx         [N, 4]  long   ï¿½ row indices into _embed_cache
+        _qry_cat_idx     [N]     long   ï¿½ row index for concatenated query text
+        _rec_idx         [N]     long   ï¿½ row indices into _question_cache
 
         Cache behaviour
         ---------------
@@ -342,7 +415,7 @@ class TableEmbedJePADataset(Dataset):
                     _best_dim, _best_file = _dim_val, _f
 
         # -- Try loading from disk -----------------------------------------------
-        print(f"[dataset][cache] looking for cache files with prefix {_prefix} …")
+        print(f"[dataset][cache] looking for cache files with prefix {_prefix} ï¿½")
         if _best_file is not None:
             print(f"[dataset][cache] loading from {_best_file.name}  (stored dim={_best_dim})")
             _ckpt = torch.load(_best_file, map_location="cpu", weights_only=False)
@@ -370,10 +443,7 @@ class TableEmbedJePADataset(Dataset):
                          upath.cell_value_b, upath.col_header_b):
                 if text not in text_to_idx:
                     text_to_idx[text] = len(text_to_idx)
-            _fmt = dict(pivot_a=upath.col_header_a, node_a=upath.cell_value_a,
-                        node_b=upath.cell_value_b,  pivot_b=upath.col_header_b)
-            for text in (self._cat_qry_template.format(**_fmt),
-                         self._cat_qry_bar_template.format(**_fmt)):
+            for text in self._serialize_queries(upath):
                 if text not in text_to_idx:
                     text_to_idx[text] = len(text_to_idx)
 
@@ -389,7 +459,7 @@ class TableEmbedJePADataset(Dataset):
         print(f"[dataset][embed_questions] {len(questions)} question embeddings...")
         self._question_cache = self._batch_embed(questions, batch_size)
 
-        # Build index tensors once — avoids per-sample dict lookups at train time
+        # Build index tensors once ï¿½ avoids per-sample dict lookups at train time
         smp_rows, qry_cat_rows, qry_bar_cat_rows, rec_list = [], [], [], []
         for r_idx, upath in self._samples:
             pa = text_to_idx[upath.col_header_a]
@@ -397,10 +467,7 @@ class TableEmbedJePADataset(Dataset):
             nb = text_to_idx[upath.cell_value_b]
             pb = text_to_idx[upath.col_header_b]
             smp_rows.append([pa, na, nb, pb])
-            _fmt = dict(pivot_a=upath.col_header_a, node_a=upath.cell_value_a,
-                        node_b=upath.cell_value_b,  pivot_b=upath.col_header_b)
-            cat_qry     = self._cat_qry_template.format(**_fmt)
-            cat_qry_bar = self._cat_qry_bar_template.format(**_fmt)
+            cat_qry, cat_qry_bar = self._serialize_queries(upath)
             qry_cat_rows.append(text_to_idx[cat_qry])
             qry_bar_cat_rows.append(text_to_idx[cat_qry_bar])
             rec_list.append(r_idx)
@@ -409,14 +476,14 @@ class TableEmbedJePADataset(Dataset):
         self._qry_bar_cat_idx = torch.tensor(qry_bar_cat_rows, dtype=torch.long)  # [N]
         self._rec_idx         = torch.tensor(rec_list,         dtype=torch.long)  # [N]
 
-        # -- Save full-dim cache — must happen before in-memory truncation --------
+        # -- Save full-dim cache ï¿½ must happen before in-memory truncation --------
         # File is named with the *actual* embed dim so any smaller truncate_embed_dim
         # can reuse it on future runs without re-computing.
         _actual_dim  = int(self._embed_cache.shape[1])
         _cache_file  = _cache_dir / f"{_prefix}{_actual_dim}.embed_cache.pt"
         print(f"[dataset][build_index] done  embed_dim={_actual_dim}")
         if self._cache_embeddings:
-            print(f"[dataset][cache] saving full-dim ({_actual_dim}) cache to {_cache_file.name} …")
+            print(f"[dataset][cache] saving full-dim ({_actual_dim}) cache to {_cache_file.name} ï¿½")
             torch.save({
                 "embed_cache":     self._embed_cache,
                 "question_cache":  self._question_cache,
@@ -453,8 +520,8 @@ class TableEmbedJePADataset(Dataset):
     # The main process retains them for evaluation / on-demand embedding calls.
     def __getstate__(self) -> dict:
         state = self.__dict__.copy()
-        state.pop("_st_model", None)   # SentenceTransformer — has thread locks
-        state.pop("_embedder", None)   # LangChain embedder  — may also have locks
+        state.pop("_st_model", None)   # SentenceTransformer ï¿½ has thread locks
+        state.pop("_embedder", None)   # LangChain embedder  ï¿½ may also have locks
         return state
 
     def __setstate__(self, state: dict) -> None:
@@ -468,8 +535,21 @@ class TableEmbedJePADataset(Dataset):
     def __getitem__(self, idx: int) -> dict:
         rec_idx, upath = self._samples[idx]
 
+        if self._smp_input_ids is not None:
+            return {
+                "smp_input_ids": self._smp_input_ids[idx],
+                "smp_attention_mask": self._smp_attention_mask[idx],
+                "query_input_ids": self._query_input_ids[idx].unsqueeze(0),
+                "query_attention_mask": self._query_attention_mask[idx].unsqueeze(0),
+                "query_bar_input_ids": self._query_bar_input_ids[idx].unsqueeze(0),
+                "query_bar_attention_mask": self._query_bar_attention_mask[idx].unsqueeze(0),
+                "question_input_ids": self._question_input_ids[rec_idx],
+                "question_attention_mask": self._question_attention_mask[rec_idx],
+                "record_idx": rec_idx,
+                "upath": upath,
+            }
         if self._smp_idx is not None:
-            # Fast path: pure tensor indexing — no dict lookup, no string hashing
+            # Fast path: pure tensor indexing ï¿½ no dict lookup, no string hashing
             smp_embeds       = self._embed_cache[self._smp_idx[idx]]                      # [4, d]
             query_embeds     = self._embed_cache[self._qry_cat_idx[idx]].unsqueeze(0)     # [1, d]
             query_bar_embeds = self._embed_cache[self._qry_bar_cat_idx[idx]].unsqueeze(0) # [1, d]
@@ -526,6 +606,27 @@ def jepa_collate_fn(batch: list) -> dict:
     """
     B = len(batch)
 
+    if "smp_input_ids" in batch[0]:
+        smp_input_ids = torch.stack([item["smp_input_ids"] for item in batch])
+        smp_attention_mask = torch.stack([item["smp_attention_mask"] for item in batch])
+        query_input_ids = torch.stack([item["query_input_ids"] for item in batch])
+        query_attention_mask = torch.stack([item["query_attention_mask"] for item in batch])
+        query_bar_input_ids = torch.stack([item["query_bar_input_ids"] for item in batch])
+        query_bar_attention_mask = torch.stack([item["query_bar_attention_mask"] for item in batch])
+        return {
+            "smp_input_ids": smp_input_ids,
+            "smp_attention_mask": smp_attention_mask,
+            "smp_bar_input_ids": smp_input_ids[:, [3, 2, 1, 0]],
+            "smp_bar_attention_mask": smp_attention_mask[:, [3, 2, 1, 0]],
+            "query_input_ids": query_input_ids,
+            "query_attention_mask": query_attention_mask,
+            "query_bar_input_ids": query_bar_input_ids,
+            "query_bar_attention_mask": query_bar_attention_mask,
+            "question_input_ids": torch.stack([item["question_input_ids"] for item in batch]),
+            "question_attention_mask": torch.stack([item["question_attention_mask"] for item in batch]),
+            "record_indices": torch.tensor([item["record_idx"] for item in batch], dtype=torch.long),
+        }
+
     smp_embeds       = torch.stack([b["smp_embeds"]       for b in batch])  # [B, 4, d]
     query_embeds     = torch.stack([b["query_embeds"]     for b in batch])  # [B, 1, d]
     query_bar_embeds = torch.stack([b["query_bar_embeds"] for b in batch])  # [B, 1, d]
@@ -580,6 +681,9 @@ class TableEmbedJePADataModule(pl.LightningDataModule):
         embed_cache_dir: Optional[Union[str, Path]] = None,
         cat_qry_template: str = "what is {pivot_a} of {node_b}({pivot_b})?",
         cat_qry_bar_template: str = "what is {pivot_b} of {node_a}({pivot_a})?",
+        tokenizer_name: Optional[str] = None,
+        max_cell_tokens: int = 32,
+        token_embed_dim: Optional[int] = None,
     ):
         super().__init__()
         self.jsonl_path  = jsonl_path
@@ -603,6 +707,9 @@ class TableEmbedJePADataModule(pl.LightningDataModule):
             embed_cache_dir=embed_cache_dir,
             cat_qry_template=cat_qry_template,
             cat_qry_bar_template=cat_qry_bar_template,
+            tokenizer_name=tokenizer_name,
+            max_cell_tokens=max_cell_tokens,
+            token_embed_dim=token_embed_dim,
         )
         self._dataset: Optional[TableEmbedJePADataset] = None
 
@@ -631,7 +738,7 @@ class TableEmbedJePADataModule(pl.LightningDataModule):
             # Restrict training to U-paths from the first record of each table.
             # The full dataset (all records) remains available for evaluation.
             _idxs = self._dataset._unique_table_train_idxs
-            print(f"[datamodule] unique_tables_only — training on "
+            print(f"[datamodule] unique_tables_only ï¿½ training on "
                   f"{len(_idxs):,} samples from "
                   f"{len(set(str(self._dataset.records[r].get('table_id', r)) for r, _ in (self._dataset._samples[i] for i in _idxs))):,} tables "
                   f"(full dataset: {len(self._dataset):,} samples)")

@@ -27,6 +27,11 @@ import torch.nn.functional as F
 from transformers import RobertaConfig
 from transformers.activations import GELUActivation
 
+try:
+    from embedding.scratch_embedder import ScratchEmbedder
+except ImportError:
+    from ..embedding.scratch_embedder import ScratchEmbedder
+
 
 # ── Model output dataclass ────────────────────────────────────────────────────
 
@@ -370,6 +375,9 @@ class TableEmbedJePA(pl.LightningModule):
         local_weight: float = 1.0,
         global_weight: float = 1.0,
         ablate_proj: bool = False,
+        vocab_size: Optional[int] = None,
+        pad_id: Optional[int] = None,
+        pretrained_embedding_model: Optional[str] = None,
     ):
         super().__init__()
         self.lr = lr
@@ -384,6 +392,20 @@ class TableEmbedJePA(pl.LightningModule):
         self.global_weight   = global_weight
 
         self.tempeture = config.tempeture
+        self.scratch_embedder: Optional[ScratchEmbedder] = None
+        self.target_scratch_embedder: Optional[ScratchEmbedder] = None
+        if vocab_size is not None:
+            if pad_id is None:
+                raise ValueError("pad_id is required with vocab_size.")
+            self.scratch_embedder = ScratchEmbedder(
+                vocab_size,
+                config.embedding_dim,
+                pad_id,
+                pretrained_model_name=pretrained_embedding_model,
+            )
+            self.target_scratch_embedder = copy.deepcopy(self.scratch_embedder)
+            for parameter in self.target_scratch_embedder.parameters():
+                parameter.requires_grad_(False)
 
         # ── Architecture ───────────────────────────────────────────────────────
         # Input projection: LLM embed_dim_in → transformer hidden_size (embed_dim_out).
@@ -423,6 +445,22 @@ class TableEmbedJePA(pl.LightningModule):
         for p_on, p_tgt in zip(self.transformer_encoder.parameters(),
                                 self.target_encoder.parameters()):
             p_tgt.data.lerp_(p_on.data, 1.0 - decay)
+        if self.scratch_embedder is not None:
+            for p_on, p_tgt in zip(self.scratch_embedder.parameters(),
+                                   self.target_scratch_embedder.parameters()):
+                p_tgt.data.lerp_(p_on.data, 1.0 - decay)
+
+    def embed_cells(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        target: bool = False,
+    ) -> torch.Tensor:
+        """Return learned cell vectors with the LLM embedder tensor contract."""
+        embedder = self.target_scratch_embedder if target else self.scratch_embedder
+        if embedder is None:
+            raise RuntimeError("This model was not configured with a learned embedder.")
+        return embedder(input_ids, attention_mask)
 
     def on_train_batch_end(self, outputs, batch, batch_idx) -> None:
         self._update_target_encoder()
@@ -436,6 +474,14 @@ class TableEmbedJePA(pl.LightningModule):
         query_embeds: Optional[torch.Tensor] = None,
         query_bar_embeds: Optional[torch.Tensor] = None,
         query_inference: Optional[torch.Tensor] = None,
+        smp_input_ids: Optional[torch.Tensor] = None,
+        smp_attention_mask: Optional[torch.Tensor] = None,
+        smp_bar_input_ids: Optional[torch.Tensor] = None,
+        smp_bar_attention_mask: Optional[torch.Tensor] = None,
+        query_input_ids: Optional[torch.Tensor] = None,
+        query_attention_mask: Optional[torch.Tensor] = None,
+        query_bar_input_ids: Optional[torch.Tensor] = None,
+        query_bar_attention_mask: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> TableEmbedJePAOutput:
         """
@@ -458,6 +504,12 @@ class TableEmbedJePA(pl.LightningModule):
             query_bar_embeds [B, 1, d_in]: LLM embed of concat(pivot_b, node_a, pivot_a)  — target for SMP_bar
             query_inference  [N, 1, d_in]: query sequences for inference mode
         """
+        if smp_input_ids is not None:
+            smp_embeds = self.embed_cells(smp_input_ids, smp_attention_mask)
+            smp_bar_embeds = self.embed_cells(smp_bar_input_ids, smp_bar_attention_mask)
+            query_embeds = self.embed_cells(query_input_ids, query_attention_mask, target=True)
+            query_bar_embeds = self.embed_cells(
+                query_bar_input_ids, query_bar_attention_mask, target=True)
         ref = smp_embeds if smp_embeds is not None else query_inference
         device = ref.device
 
@@ -575,6 +627,15 @@ class TableEmbedJePA(pl.LightningModule):
             smp_bar_embeds=batch["smp_bar_embeds"],
             query_embeds=batch["query_embeds"],
             query_bar_embeds=batch["query_bar_embeds"],
+        ) if "smp_embeds" in batch else self(
+            smp_input_ids=batch["smp_input_ids"],
+            smp_attention_mask=batch["smp_attention_mask"],
+            smp_bar_input_ids=batch["smp_bar_input_ids"],
+            smp_bar_attention_mask=batch["smp_bar_attention_mask"],
+            query_input_ids=batch["query_input_ids"],
+            query_attention_mask=batch["query_attention_mask"],
+            query_bar_input_ids=batch["query_bar_input_ids"],
+            query_bar_attention_mask=batch["query_bar_attention_mask"],
         )
 
         # Guard against NaN/Inf loss (can occur on degenerate per-table batches
@@ -588,7 +649,7 @@ class TableEmbedJePA(pl.LightningModule):
                   f"global={out.global_loss.item():.4g}) — step skipped")
             return None   # Lightning 2.0: skip without updating weights
 
-        B  = batch["smp_embeds"].shape[0]
+        B = (batch["smp_embeds"] if "smp_embeds" in batch else batch["smp_input_ids"]).shape[0]
         kw = dict(on_step=True, on_epoch=True, batch_size=B)
         self.log("train_loss",  out.loss,        prog_bar=True,  **kw)
         # Raw (unweighted) individual losses — always logged for monitoring

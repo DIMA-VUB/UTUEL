@@ -21,6 +21,7 @@ Loss weights are configured in the `loss:` section of config.yaml.
 from __future__ import annotations
 
 import hashlib
+import importlib.util
 import json
 import sys
 from collections import Counter, defaultdict
@@ -39,10 +40,30 @@ from pytorch_lightning.callbacks import EarlyStopping, LearningRateMonitor, Mode
 # Allow `python TRL-model/train.py` from the repo root
 _HERE = Path(__file__).parent
 sys.path.insert(0, str(_HERE.parent))
+sys.path.insert(0, str(_HERE.parent / "TRL_Adhesive"))
 
 from config  import TableEmbedJePAConfig                       # noqa: E402
-from model   import TableEmbedJePA                                  # noqa: E402
-from dataset import TableEmbedJePADataModule                   # noqa: E402
+
+_MODEL_SPEC = importlib.util.spec_from_file_location(
+    "trl_model_architecture",
+    _HERE / "model" / "__init__.py",
+    submodule_search_locations=[str(_HERE / "model")],
+)
+if _MODEL_SPEC is None or _MODEL_SPEC.loader is None:
+    raise ImportError(f"Cannot load model package from {_HERE / 'model'}")
+_MODEL_MODULE = importlib.util.module_from_spec(_MODEL_SPEC)
+sys.modules[_MODEL_SPEC.name] = _MODEL_MODULE
+_MODEL_SPEC.loader.exec_module(_MODEL_MODULE)
+TableEmbedJePA = _MODEL_MODULE.TableEmbedJePA
+
+_DATASET_SPEC = importlib.util.spec_from_file_location("trl_model_dataset", _HERE / "dataset.py")
+if _DATASET_SPEC is None or _DATASET_SPEC.loader is None:
+    raise ImportError(f"Cannot load dataset module from {_HERE / 'dataset.py'}")
+_DATASET_MODULE = importlib.util.module_from_spec(_DATASET_SPEC)
+sys.modules[_DATASET_SPEC.name] = _DATASET_MODULE
+_DATASET_SPEC.loader.exec_module(_DATASET_MODULE)
+TableEmbedJePADataModule = _DATASET_MODULE.TableEmbedJePADataModule
+from stopwords_util import remove_stopwords                    # noqa: E402
 import logging
 # Suppress httpx / httpcore / LangChain HTTP INFO chatter so only
 # the pipeline's own progress lines appear in the terminal.
@@ -51,7 +72,12 @@ for _noisy in ("httpx", "httpcore", "langchain", "langchain_core", "ollama"):
 
 # ── Model factory ─────────────────────────────────────────────────────────────
 
-def build_model(cfg: DictConfig, embed_dim_in: int) -> TableEmbedJePA:
+def build_model(
+    cfg: DictConfig,
+    embed_dim_in: int,
+    vocab_size: int | None = None,
+    pad_id: int | None = None,
+) -> TableEmbedJePA:
     """
     Instantiate a TableEmbedJePA model.
 
@@ -79,6 +105,11 @@ def build_model(cfg: DictConfig, embed_dim_in: int) -> TableEmbedJePA:
         beta=cfg.model.beta,
     )
     ablate_proj = bool(OmegaConf.select(cfg, "model.ablate_proj", default=False))
+    pretrained_embedding_model = (
+        OmegaConf.select(cfg, "embedder.pretrained_model_name", default=None)
+        if OmegaConf.select(cfg, "embedder.embedding_init", default="random") == "pretrained"
+        else None
+    )
     return TableEmbedJePA(
         config=model_cfg,
         lr=cfg.training.lr,
@@ -90,6 +121,9 @@ def build_model(cfg: DictConfig, embed_dim_in: int) -> TableEmbedJePA:
         local_weight=cfg.loss.local,
         global_weight=cfg.loss["global"],
         ablate_proj=ablate_proj,
+        vocab_size=vocab_size,
+        pad_id=pad_id,
+        pretrained_embedding_model=pretrained_embedding_model,
     )
 
 
@@ -237,6 +271,10 @@ def evaluate_model(
         sp: {"mrr": [], "h1": [], "h1r": [], "h1c": [], "h3": [], "h5": []}
         for sp in _SPACES
     }
+    sw_accs: dict[str, dict[str, list]] = {
+        sp: {"mrr": [], "h1": [], "h1r": [], "h1c": [], "h3": [], "h5": []}
+        for sp in _SPACES
+    }
     tbl_hits: dict[str, list] = {
         "node_h1": [], "node_h3": [], "node_h5": [], "node_h10": [], "node_h20": [],
         "col_h1":  [], "col_h3":  [], "col_h5":  [], "col_h10":  [], "col_h20":  [],
@@ -247,6 +285,7 @@ def evaluate_model(
         "row_tsr_h1": [], "row_tsr_h3": [], "row_tsr_h5": [], "row_tsr_h10": [], "row_tsr_h20": [],
         "tbl_tsr_h1": [], "tbl_tsr_h3": [], "tbl_tsr_h5": [], "tbl_tsr_h10": [], "tbl_tsr_h20": [],
     }
+    sw_tbl_hits: dict[str, list] = {key: [] for key in tbl_hits}
     per_record: list[dict]             = []
     skipped = 0
 
@@ -270,7 +309,13 @@ def evaluate_model(
         ups  = [ds._samples[j][1] for j in sample_js]
         n_up = len(ups)
         idx_t   = torch.tensor(sample_js, dtype=torch.long)
-        smp_raw = ds._embed_cache[ds._smp_idx[idx_t]].to(device)
+        if ds._smp_input_ids is not None:
+            smp_raw = model.embed_cells(
+                ds._smp_input_ids[idx_t].to(device),
+                ds._smp_attention_mask[idx_t].to(device),
+            )
+        else:
+            smp_raw = ds._embed_cache[ds._smp_idx[idx_t]].to(device)
 
         with torch.no_grad():
             proj = model.input_projection(smp_raw)
@@ -350,8 +395,14 @@ def evaluate_model(
             gt_cells = {(rr + 1, target_col) for rr in target_rows}
             gt_rows  = {rr + 1 for rr in target_rows}
 
-            # Encode question through the online encoder using precomputed LLM embedding
-            q_raw = ds._question_cache[rec_idx].unsqueeze(0).to(device)  # [1, d_in]
+            # Encode a question through the online encoder.
+            if ds._question_input_ids is not None:
+                q_raw = model.embed_cells(
+                    ds._question_input_ids[rec_idx].unsqueeze(0).to(device),
+                    ds._question_attention_mask[rec_idx].unsqueeze(0).to(device),
+                )
+            else:
+                q_raw = ds._question_cache[rec_idx].unsqueeze(0).to(device)
             with torch.no_grad():
                 q_proj = model.input_projection(q_raw.unsqueeze(1))   # [1, 1, d_out]
                 enc_q, _, _ = model.transformer_encoder(q_proj)
@@ -394,19 +445,23 @@ def evaluate_model(
                 accs[sp]["h5"].append(float(r["h5"]))
 
             # ── Table retrieval: node / col / row / table level ───────────────────
-            def _majority_vote(g_embs: torch.Tensor, g_tids: list) -> tuple:
+            def _majority_vote(
+                g_embs: torch.Tensor, g_tids: list, query_vector: torch.Tensor,
+            ) -> tuple:
                 """Top-k cosine sim → majority vote by table_id → top-20 tables."""
                 _k_   = min(top_k_table, g_embs.shape[0])
                 _tops = [g_tids[i]
-                         for i in (g_embs @ q_norm.T).squeeze(-1).topk(_k_).indices.tolist()]
+                         for i in (g_embs @ query_vector.T).squeeze(-1).topk(_k_).indices.tolist()]
                 _v    = [t for t, _ in Counter(_tops).most_common(20)]
                 return (bool(_v) and _v[0] == tid,
                         tid in _v[:3], tid in _v[:5], tid in _v[:10], tid in _v, _v)
 
-            def _top_score_rank(g_embs: torch.Tensor, g_tids: list) -> tuple:
+            def _top_score_rank(
+                g_embs: torch.Tensor, g_tids: list, query_vector: torch.Tensor,
+            ) -> tuple:
                 """Argsort all node cosine sims; unique table_ids by first-appearance
                 order (= descending max-score per table) → top-20 ranked table list."""
-                _sims = (g_embs @ q_norm.T).squeeze(-1)
+                _sims = (g_embs @ query_vector.T).squeeze(-1)
                 _k    = min(top_k_table, _sims.shape[0])
                 _top_scores, _top_idx = _sims.topk(_k)          # stays on GPU; only k indices
                 _seen: dict = {}
@@ -430,13 +485,13 @@ def evaluate_model(
             _e10 = tid in _top_t[:10]
             _e20 = tid in _top_t
 
-            _n1, _n3, _n5, _n10, _n20, _top_node    = _majority_vote(global_embs,     _glob_tids)
-            _c1, _c3, _c5, _c10, _c20, _top_col     = _majority_vote(global_col_embs, _glob_col_tids)
-            _r1, _r3, _r5, _r10, _r20, _top_row     = _majority_vote(global_row_embs, _glob_row_tids)
-            _s1, _s3, _s5, _s10, _s20, _top_tsr     = _top_score_rank(global_embs,    _glob_tids)
-            _cs1, _cs3, _cs5, _cs10, _cs20, _top_col_tsr = _top_score_rank(global_col_embs, _glob_col_tids)
-            _rs1, _rs3, _rs5, _rs10, _rs20, _top_row_tsr = _top_score_rank(global_row_embs, _glob_row_tids)
-            _ts1, _ts3, _ts5, _ts10, _ts20, _top_tbl_tsr = _top_score_rank(global_tbl_embs, _glob_tbl_tids)
+            _n1, _n3, _n5, _n10, _n20, _top_node    = _majority_vote(global_embs,     _glob_tids, q_norm)
+            _c1, _c3, _c5, _c10, _c20, _top_col     = _majority_vote(global_col_embs, _glob_col_tids, q_norm)
+            _r1, _r3, _r5, _r10, _r20, _top_row     = _majority_vote(global_row_embs, _glob_row_tids, q_norm)
+            _s1, _s3, _s5, _s10, _s20, _top_tsr     = _top_score_rank(global_embs,    _glob_tids, q_norm)
+            _cs1, _cs3, _cs5, _cs10, _cs20, _top_col_tsr = _top_score_rank(global_col_embs, _glob_col_tids, q_norm)
+            _rs1, _rs3, _rs5, _rs10, _rs20, _top_row_tsr = _top_score_rank(global_row_embs, _glob_row_tids, q_norm)
+            _ts1, _ts3, _ts5, _ts10, _ts20, _top_tbl_tsr = _top_score_rank(global_tbl_embs, _glob_tbl_tids, q_norm)
 
             tbl_hits["node_h1"].append(float(_n1)); tbl_hits["node_h3"].append(float(_n3))
             tbl_hits["node_h5"].append(float(_n5)); tbl_hits["node_h10"].append(float(_n10)); tbl_hits["node_h20"].append(float(_n20))
@@ -455,16 +510,97 @@ def evaluate_model(
             tbl_hits["tbl_tsr_h1"].append(float(_ts1)); tbl_hits["tbl_tsr_h3"].append(float(_ts3))
             tbl_hits["tbl_tsr_h5"].append(float(_ts5)); tbl_hits["tbl_tsr_h10"].append(float(_ts10)); tbl_hits["tbl_tsr_h20"].append(float(_ts20))
 
+            question_sw = remove_stopwords(question)
+            if ds._question_input_ids is not None:
+                sw_tokens = ds._tokenizer(
+                    [question_sw], padding="max_length", truncation=True,
+                    max_length=ds._max_cell_tokens, return_tensors="pt",
+                )
+                sw_raw = model.embed_cells(
+                    sw_tokens["input_ids"].to(device),
+                    sw_tokens["attention_mask"].to(device),
+                )
+            else:
+                sw_raw = ds._embed_live(question_sw).unsqueeze(0).to(device)
+            with torch.no_grad():
+                sw_proj = model.input_projection(sw_raw.unsqueeze(1))
+                sw_enc, _, _ = model.transformer_encoder(sw_proj)
+                sw_norm = F.normalize(sw_enc[:, 0, :], dim=-1)
+
+            def _rank_space_sw(embs: torch.Tensor, coord_fn) -> dict:
+                sims = (embs @ sw_norm.T).squeeze(-1)
+                ranked = sims.argsort(descending=True).tolist()
+                top1 = coord_fn(ranked[0])
+                return {
+                    "top1": list(top1),
+                    "rr": next((1.0 / rank for rank, idx in enumerate(ranked, 1)
+                                if coord_fn(idx) in gt_cells), 0.0),
+                    "h1": top1 in gt_cells,
+                    "h1r": top1[0] in gt_rows,
+                    "h1c": top1[1] == target_col,
+                    "h3": any(coord_fn(idx) in gt_cells for idx in ranked[:3]),
+                    "h5": any(coord_fn(idx) in gt_cells for idx in ranked[:5]),
+                }
+
+            sw_res = {
+                "SMP_node_a": _rank_space_sw(na, coord_a),
+                "SMP_bar_node_b": _rank_space_sw(nb, coord_b),
+                "both": _rank_space_sw(both_embs, coord_both),
+            }
+            for sp in _SPACES:
+                r = sw_res[sp]
+                sw_accs[sp]["mrr"].append(r["rr"])
+                sw_accs[sp]["h1"].append(float(r["h1"]))
+                sw_accs[sp]["h1r"].append(float(r["h1r"]))
+                sw_accs[sp]["h1c"].append(float(r["h1c"]))
+                sw_accs[sp]["h3"].append(float(r["h3"]))
+                sw_accs[sp]["h5"].append(float(r["h5"]))
+
+            sw_n1, sw_n3, sw_n5, sw_n10, sw_n20, sw_top_node = _majority_vote(
+                global_embs, _glob_tids, sw_norm)
+            sw_c1, sw_c3, sw_c5, sw_c10, sw_c20, sw_top_col = _majority_vote(
+                global_col_embs, _glob_col_tids, sw_norm)
+            sw_r1, sw_r3, sw_r5, sw_r10, sw_r20, sw_top_row = _majority_vote(
+                global_row_embs, _glob_row_tids, sw_norm)
+            sw_s1, sw_s3, sw_s5, sw_s10, sw_s20, sw_top_tsr = _top_score_rank(
+                global_embs, _glob_tids, sw_norm)
+            sw_cs1, sw_cs3, sw_cs5, sw_cs10, sw_cs20, sw_top_col_tsr = _top_score_rank(
+                global_col_embs, _glob_col_tids, sw_norm)
+            sw_rs1, sw_rs3, sw_rs5, sw_rs10, sw_rs20, sw_top_row_tsr = _top_score_rank(
+                global_row_embs, _glob_row_tids, sw_norm)
+            sw_ts1, sw_ts3, sw_ts5, sw_ts10, sw_ts20, sw_top_tbl_tsr = _top_score_rank(
+                global_tbl_embs, _glob_tbl_tids, sw_norm)
+            sw_top_t = [_glob_tbl_tids[i] for i in (global_tbl_embs @ sw_norm.T).squeeze(-1)
+                        .topk(min(20, global_tbl_embs.shape[0])).indices.tolist()]
+            for key, value in {
+                "node_h1": sw_n1, "node_h3": sw_n3, "node_h5": sw_n5, "node_h10": sw_n10, "node_h20": sw_n20,
+                "col_h1": sw_c1, "col_h3": sw_c3, "col_h5": sw_c5, "col_h10": sw_c10, "col_h20": sw_c20,
+                "row_h1": sw_r1, "row_h3": sw_r3, "row_h5": sw_r5, "row_h10": sw_r10, "row_h20": sw_r20,
+                "tbl_h1": bool(sw_top_t) and sw_top_t[0] == tid, "tbl_h3": tid in sw_top_t[:3],
+                "tbl_h5": tid in sw_top_t[:5], "tbl_h10": tid in sw_top_t[:10], "tbl_h20": tid in sw_top_t,
+                "tsr_h1": sw_s1, "tsr_h3": sw_s3, "tsr_h5": sw_s5, "tsr_h10": sw_s10, "tsr_h20": sw_s20,
+                "col_tsr_h1": sw_cs1, "col_tsr_h3": sw_cs3, "col_tsr_h5": sw_cs5, "col_tsr_h10": sw_cs10, "col_tsr_h20": sw_cs20,
+                "row_tsr_h1": sw_rs1, "row_tsr_h3": sw_rs3, "row_tsr_h5": sw_rs5, "row_tsr_h10": sw_rs10, "row_tsr_h20": sw_rs20,
+                "tbl_tsr_h1": sw_ts1, "tbl_tsr_h3": sw_ts3, "tbl_tsr_h5": sw_ts5, "tbl_tsr_h10": sw_ts10, "tbl_tsr_h20": sw_ts20,
+            }.items():
+                sw_tbl_hits[key].append(float(value))
+
             per_record.append({
                 "rec_idx":     rec_idx,
                 "table_id":    tid,
                 "record_id":   record_id,
                 "question":    question,
+                "question_sw": question_sw,
                 "target_col":  target_col,
                 "target_rows": list(target_rows),
                 "SMP_node_a":     res["SMP_node_a"],
                 "SMP_bar_node_b": res["SMP_bar_node_b"],
                 "both":           res["both"],
+                "SW": {
+                    "SMP_node_a": sw_res["SMP_node_a"],
+                    "SMP_bar_node_b": sw_res["SMP_bar_node_b"],
+                    "both": sw_res["both"],
+                },
                 "table_retrieval": {
                     "node": {"Table@1": _n1, "Table@3": _n3, "Table@5": _n5, "Table@10": _n10, "Table@20": _n20, "top_tables": _top_node},
                     "col":  {"Table@1": _c1, "Table@3": _c3, "Table@5": _c5, "Table@10": _c10, "Table@20": _c20, "top_tables": _top_col},
@@ -523,6 +659,8 @@ def evaluate_model(
 
     metrics                 = {sp: _agg(accs[sp]) for sp in _SPACES}
     table_retrieval_metrics = _agg_tbl(tbl_hits)
+    sw_metrics              = {sp: _agg(sw_accs[sp]) for sp in _SPACES}
+    sw_table_retrieval_metrics = _agg_tbl(sw_tbl_hits)
 
     _cfg_yaml     = OmegaConf.to_yaml(cfg)
     _eval_cfg_hash = hashlib.md5(_cfg_yaml.encode()).hexdigest()[:8]
@@ -540,7 +678,11 @@ def evaluate_model(
             "model_class":   type(model).__name__,
             "training_mode": cfg.training.get("mode", "global"),
             "seed":          int(cfg.training.seed),
-            "embedder":      cfg.embedder.model_name,
+            "embedder":      (
+                OmegaConf.select(cfg, "embedder.tokenizer")
+                if OmegaConf.select(cfg, "embedder.model_type") == "scratch"
+                else cfg.embedder.model_name
+            ),
             "data_path":     str(cfg.data.path),
             "max_records":   cfg.data.max_records,
             "n_tables":      n_tables,
@@ -579,9 +721,11 @@ def evaluate_model(
             "ablate_proj":   bool(OmegaConf.select(cfg, "model.ablate_proj", default=False)),
             # "cfg":           OmegaConf.to_container(cfg, resolve=True),
         },
-        "metrics":          metrics,
-        "table_retrieval":  table_retrieval_metrics,
-        "per_record":       per_record,
+        "metrics":             metrics,
+        "table_retrieval":     table_retrieval_metrics,
+        "SW_metrics":          sw_metrics,
+        "SW_table_retrieval":  sw_table_retrieval_metrics,
+        "per_record":          per_record,
     }
 
     out_path.write_text(json.dumps(results, indent=2, ensure_ascii=False))
@@ -600,6 +744,16 @@ def evaluate_model(
         )
         print(f"[eval] {m:<14}{vals}")
     print(sep)
+    print(f"[eval] SW query (stop-words removed): {header}")
+    print(sep)
+    for m in ("MRR", "Hit@1", "Hit@1_Row", "Hit@1_Col", "Hit@3", "Hit@5"):
+        vals = "".join(
+            f"{sw_metrics[sp][m]:>{_COL}.4f}" if m == "MRR"
+            else f"{str(sw_metrics[sp][m]) + '%':>{_COL}}"
+            for sp in _SPACES
+        )
+        print(f"[eval] {m:<14}{vals}")
+    print(sep)
     _TLEVELS = ("node", "col", "row", "tbl", "tsr", "col_tsr", "row_tsr", "tbl_tsr")
     _TW = 11
     _n_eval = table_retrieval_metrics["n_evaluated"]
@@ -609,6 +763,13 @@ def evaluate_model(
     for _tm in ("Table@1", "Table@3", "Table@5", "Table@10", "Table@20"):
         print(f"[eval]   {_tm:<10}" + "".join(
             f"{str(table_retrieval_metrics[l][_tm]) + '%':>{_TW}}"
+            for l in _TLEVELS))
+    print(f"\n[eval] SW table retrieval  (n={sw_table_retrieval_metrics['n_evaluated']}  top-{top_k_table})")
+    print("[eval]   " + f"{'level':<10}" + "".join(f"{l:>{_TW}}" for l in _TLEVELS))
+    print("[eval]   " + "-" * (10 + _TW * len(_TLEVELS)))
+    for _tm in ("Table@1", "Table@3", "Table@5", "Table@10", "Table@20"):
+        print(f"[eval]   {_tm:<10}" + "".join(
+            f"{str(sw_table_retrieval_metrics[l][_tm]) + '%':>{_TW}}"
             for l in _TLEVELS))
     print(f"[eval] Results \u2192 {out_path}")
     return results
@@ -626,12 +787,19 @@ def _train_one(
     print(f"[train] embed_dim_in={embed_dim_in}  hidden_size={cfg.model.hidden_size}"
           f"  samples={len(dm._dataset)}")
 
-    lightning_model = build_model(cfg, embed_dim_in)
+    tokenizer = dm._dataset._tokenizer
+    lightning_model = build_model(
+        cfg,
+        embed_dim_in,
+        vocab_size=len(tokenizer) if tokenizer is not None else None,
+        pad_id=tokenizer.pad_token_id if tokenizer is not None else None,
+    )
     n_params = sum(p.numel() for p in lightning_model.parameters() if p.requires_grad)
     print(f"[train] trainable params: {n_params:,}")
 
     # Subfolder = last component of the embedder model name (sanitized)
-    _model_slug = cfg.embedder.model_name.split("/")[-1].replace(" ", "_").replace(":", "#")
+    _model_name = (tokenizer.name_or_path if tokenizer is not None else cfg.embedder.model_name)
+    _model_slug = _model_name.split("/")[-1].replace(" ", "_").replace(":", "#")
 
     # Append a timestamp suffix so each run writes to its own directory and
     # never overwrites a previous run (e.g. checkpoints/2026-05-28_14-03-22/).
@@ -747,6 +915,27 @@ def train(cfg: DictConfig) -> float:
     mode = cfg.training.get("mode", "global")
 
     # ── Common DataModule kwargs ──────────────────────────────────────────────
+    v1_embedding = OmegaConf.select(cfg, "embedding", default=None)
+    use_scratch_embedder = (
+        OmegaConf.select(cfg, "embedder.model_type", default=None) == "scratch"
+        or (
+            v1_embedding is not None
+            and OmegaConf.select(cfg, "embedding.embedder", default=None) is None
+        )
+    )
+    if use_scratch_embedder and bool(OmegaConf.select(cfg, "model.ablate_proj", default=False)):
+        embed_dim = int(OmegaConf.select(
+            cfg,
+            "embedder.embed_dim" if OmegaConf.select(cfg, "embedder.model_type") == "scratch"
+            else "embedding.embed_dim",
+            default=cfg.model.hidden_size,
+        ))
+        if embed_dim != int(cfg.model.hidden_size):
+            raise ValueError(
+                "model.ablate_proj=true requires the scratch embed_dim to equal model.hidden_size "
+                f"({embed_dim} != {cfg.model.hidden_size})."
+            )
+
     _dm_kwargs = dict(
         batch_size=cfg.training.batch_size,
         num_workers=cfg.training.dataloader_num_workers,
@@ -768,7 +957,28 @@ def train(cfg: DictConfig) -> float:
                                           default="what is {pivot_a} of {node_b}({pivot_b})?"),
         cat_qry_bar_template=OmegaConf.select(cfg, "query.cat_qry_bar_template",
                                               default="what is {pivot_b} of {node_a}({pivot_a})?"),
-
+        tokenizer_name=(
+            OmegaConf.select(
+                cfg,
+                "embedder.tokenizer" if OmegaConf.select(cfg, "embedder.model_type") == "scratch"
+                else "embedding.tokenizer",
+            ) if use_scratch_embedder else None
+        ),
+        max_cell_tokens=int(OmegaConf.select(
+            cfg,
+            "embedder.max_cell_tokens" if OmegaConf.select(cfg, "embedder.model_type") == "scratch"
+            else "embedding.max_cell_tokens",
+            default=32,
+        )),
+        token_embed_dim=(
+            int(OmegaConf.select(
+                cfg,
+                "embedder.embed_dim" if OmegaConf.select(cfg, "embedder.model_type") == "scratch"
+                else "embedding.embed_dim",
+                default=cfg.model.hidden_size,
+            ))
+            if use_scratch_embedder else None
+        ),
     )
 
     if mode == "per_table":
