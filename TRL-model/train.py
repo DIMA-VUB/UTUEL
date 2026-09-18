@@ -77,6 +77,7 @@ def build_model(
     embed_dim_in: int,
     vocab_size: int | None = None,
     pad_id: int | None = None,
+    cls_token_id: int | None = None,
 ) -> TableEmbedJePA:
     """
     Instantiate a TableEmbedJePA model.
@@ -124,6 +125,8 @@ def build_model(
         vocab_size=vocab_size,
         pad_id=pad_id,
         pretrained_embedding_model=pretrained_embedding_model,
+        scratch_pooling=OmegaConf.select(cfg, "embedder.scratch_pooling", default="mean"),
+        scratch_cls_token_id=cls_token_id,
     )
 
 
@@ -793,6 +796,7 @@ def _train_one(
         embed_dim_in,
         vocab_size=len(tokenizer) if tokenizer is not None else None,
         pad_id=tokenizer.pad_token_id if tokenizer is not None else None,
+        cls_token_id=tokenizer.cls_token_id if tokenizer is not None else None,
     )
     n_params = sum(p.numel() for p in lightning_model.parameters() if p.requires_grad)
     print(f"[train] trainable params: {n_params:,}")

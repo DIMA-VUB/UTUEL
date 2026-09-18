@@ -378,6 +378,8 @@ class TableEmbedJePA(pl.LightningModule):
         vocab_size: Optional[int] = None,
         pad_id: Optional[int] = None,
         pretrained_embedding_model: Optional[str] = None,
+        scratch_pooling: str = "mean",
+        scratch_cls_token_id: Optional[int] = None,
     ):
         super().__init__()
         self.lr = lr
@@ -402,6 +404,8 @@ class TableEmbedJePA(pl.LightningModule):
                 config.embedding_dim,
                 pad_id,
                 pretrained_model_name=pretrained_embedding_model,
+                pooling=scratch_pooling,
+                cls_token_id=scratch_cls_token_id,
             )
             self.target_scratch_embedder = copy.deepcopy(self.scratch_embedder)
             for parameter in self.target_scratch_embedder.parameters():

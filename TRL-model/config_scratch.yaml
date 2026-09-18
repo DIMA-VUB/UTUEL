@@ -49,9 +49,10 @@ embedder:
   base_url: null
   api_key: null
   precompute: false
-  embed_batch_size: 64
+  embed_batch_size: 128
   cache_embeddings: false
   embed_cache_dir: null
+  scratch_pooling: cls_attention  # mean | cls_attention; returns self-attended tokenizer CLS at position 0
 
 # ── Query templates ─────────────────────────────────────────────────────────
 query:
