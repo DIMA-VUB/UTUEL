@@ -1,0 +1,36 @@
+# Prompt pipeline configuration for jointly row- and column-permuted WikiSQL tables.
+ollama:
+  num_parallel: 16
+  max_loaded_models: 4
+  max_queue: 4096
+
+pipeline:
+  num_runs: 1
+  ollama_base_url: http://${oc.env:OLLAMA_IP,localhost}:11434
+
+datasets:
+  - &rows_columns_dataset
+    name: test_lookup_WikiSQL
+    path: permutation_invariance/datasets/test_lookup_WikiSQL_rows_columns.jsonl
+    model: llama3
+    prompt_key: prompt
+    prompt_template: prompts_pipeline/prompt_templates/prompt_test_lookup_WikiSQL.txt
+  - <<: *rows_columns_dataset
+    model: gemma2
+  - <<: *rows_columns_dataset
+    model: tablellm-7b-Q4
+  - <<: *rows_columns_dataset
+    model: qwen3.6:27b
+  - <<: *rows_columns_dataset
+    model: deepseek-r1
+  - <<: *rows_columns_dataset
+    model: gemma4
+  - <<: *rows_columns_dataset
+    model: TableGPT2-7B
+  - <<: *rows_columns_dataset
+    model: gpt-oss
+
+hydra:
+  run:
+    dir: .
+  output_subdir: null

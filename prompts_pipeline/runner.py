@@ -10,6 +10,7 @@ num_parallel prompts are sent in-flight per model via abatch().
 
 import asyncio
 import json
+import re
 import sys
 import time
 import uuid
@@ -36,6 +37,21 @@ def _append_jsonl(path: Path, obj: dict) -> None:
 def _progress_bar(done: int, total: int, width: int = 20) -> str:
     filled = int(width * done / total) if total else 0
     return f"[{'█' * filled}{'░' * (width - filled)}] {done}/{total}"
+
+
+def _fallback_token_count(text: str | None) -> int:
+    """Return a provider-independent whitespace-token estimate."""
+    return len(re.findall(r"\S+", text or ""))
+
+
+def _token_counts(generation, prompt: str) -> tuple[int, int, bool]:
+    """Use Ollama's prompt/eval counts, or return whitespace-count estimates."""
+    info = generation.generation_info or {}
+    input_tokens = info.get("prompt_eval_count")
+    output_tokens = info.get("eval_count")
+    if isinstance(input_tokens, int) and isinstance(output_tokens, int):
+        return input_tokens, output_tokens, False
+    return _fallback_token_count(prompt), _fallback_token_count(generation.text), True
 
 
 # ── dataset config ────────────────────────────────────────────────────────────
@@ -193,10 +209,13 @@ class PipelineRunner:
                 async with lock:
                     in_flight += 1
                 try:
-                    response = await llm.ainvoke(prompt)
-                    status, text = "ok", response
+                    result = await llm.agenerate([prompt])
+                    generation = result.generations[0][0]
+                    status, text = "ok", generation.text
+                    input_tokens, output_tokens, estimated_tokens = _token_counts(generation, prompt)
                 except Exception as exc:
                     status, text = f"error: {exc}", None
+                    input_tokens, output_tokens, estimated_tokens = 0, 0, False
                 finally:
                     async with lock:
                         in_flight -= 1
@@ -204,6 +223,7 @@ class PipelineRunner:
             async with lock:
                 if status == "ok":
                     successes += 1
+                    stats.record_tokens(input_tokens, output_tokens, estimated_tokens)
                 else:
                     errors += 1
                 done += 1
@@ -228,6 +248,9 @@ class PipelineRunner:
                     "prompt":   prompt,
                     "response": text,
                     "status":   status,
+                    "token_in_prompt": input_tokens,
+                    "token_in_output": output_tokens,
+                    "token_counts_estimated": estimated_tokens,
                     **extra,
                 })
 

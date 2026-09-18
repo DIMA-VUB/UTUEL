@@ -164,8 +164,9 @@ def compile_dataset(dataset_dir: Path) -> Path:
                         "prediction":   prediction,
                         "parse_ok":     parse_ok,
                         "correct":      is_correct(prediction, ground_truth),
-                        "token_in_prompt": _count_tokens(prompt_text),
+                        "token_in_prompt": record.get("token_in_prompt") if record.get("token_in_prompt") is not None else _count_tokens(prompt_text),
                         "token_in_output": record.get("token_in_output") if record.get("token_in_output") is not None else _count_tokens(response_text),
+                        "token_counts_estimated": bool(record.get("token_counts_estimated", False)),
                     }
                     out_f.write(json.dumps(compiled, ensure_ascii=False) + "\n")
                     total += 1

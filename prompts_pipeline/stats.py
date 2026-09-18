@@ -18,6 +18,9 @@ class RunStats:
     succeeded: int = 0
     failed: int = 0
     total_batches: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    estimated_token_counts: int = 0
 
     _finished_at: float | None = None
 
@@ -28,6 +31,12 @@ class RunStats:
         self.dispatched += batch_size
         self.succeeded += successes
         self.failed += batch_size - successes
+
+    def record_tokens(self, input_tokens: int, output_tokens: int, estimated: bool) -> None:
+        """Add token counts for one successful model response."""
+        self.input_tokens += input_tokens
+        self.output_tokens += output_tokens
+        self.estimated_token_counts += int(estimated)
 
     def finish(self) -> None:
         self._finished_at = time.time()
@@ -55,6 +64,10 @@ class RunStats:
             "succeeded":        self.succeeded,
             "failed":           self.failed,
             "total_batches":    self.total_batches,
+            "input_tokens":     self.input_tokens,
+            "output_tokens":    self.output_tokens,
+            "total_tokens":     self.input_tokens + self.output_tokens,
+            "estimated_token_counts": self.estimated_token_counts,
             "throughput_rps":   self.throughput,
         }
 
@@ -70,6 +83,10 @@ class RunStats:
             f"│  succeeded       {d['succeeded']}",
             f"│  failed          {d['failed']}",
             f"│  batches sent    {d['total_batches']}",
+            f"│  input tokens    {d['input_tokens']}",
+            f"│  output tokens   {d['output_tokens']}",
+            f"│  total tokens    {d['total_tokens']}",
+            f"│  estimated counts {d['estimated_token_counts']}",
             f"│  throughput      {d['throughput_rps']} resp/s",
             "└────────────────────────────────────",
         ]
