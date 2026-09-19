@@ -158,6 +158,35 @@ def build_top_k_export(
     return export
 
 
+def save_embedding_export(
+    output_path: Path,
+    *,
+    table_ids: list[str],
+    query_ids: list[str],
+    queries: list[str],
+    gold_ids: list[str],
+    table_embeddings: np.ndarray,
+    query_embeddings: np.ndarray,
+    table_variants: dict[str, np.ndarray] | None,
+    metadata: dict,
+) -> None:
+    """Save retrieval inputs as a compressed, self-describing NumPy archive."""
+    arrays: dict[str, np.ndarray] = {
+        "table_ids": np.asarray(table_ids, dtype=str),
+        "query_ids": np.asarray(query_ids, dtype=str),
+        "queries": np.asarray(queries, dtype=str),
+        "gold_table_ids": np.asarray(gold_ids, dtype=str),
+        "table_embeddings": np.asarray(table_embeddings, dtype=np.float32),
+        "query_embeddings": np.asarray(query_embeddings, dtype=np.float32),
+        "metadata_json": np.asarray(json.dumps(metadata, ensure_ascii=False), dtype=str),
+    }
+    if table_variants:
+        for name, embeddings in table_variants.items():
+            arrays[f"table_embeddings_{name}"] = np.asarray(embeddings, dtype=np.float32)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(output_path, **arrays)
+
+
 # ── Main evaluation loop ──────────────────────────────────────────────────────
 
 def run_entry(
@@ -177,6 +206,7 @@ def run_entry(
     top_k_exp     = retrieval_cfg.get("top_k_export", 5)
     tsr_top_k     = retrieval_cfg.get("tsr_top_k",     2000)
     tsr_mrr_depth = retrieval_cfg.get("tsr_mrr_depth", 2000)
+    save_embeddings = bool(retrieval_cfg.get("save_embeddings", False))
 
     # ── Build embedder ────────────────────────────────────────────────────────
     print(f"\n{'='*60}")
@@ -191,6 +221,7 @@ def run_entry(
     records  = load_jsonl(ds_path)
     gold_ids = [rec["table_id"] for rec in records]
     queries  = [rec["question"] for rec in records]
+    query_ids = [str(rec.get("id", index)) for index, rec in enumerate(records)]
     print(f"  {len(records):,} records loaded")
 
     # ── Unique tables ─────────────────────────────────────────────────────────
@@ -298,6 +329,7 @@ def run_entry(
     safe_label = run_label.replace("/", "_").replace(":", "_").replace("#", "_")
     result_path = output_dir / f"{safe_label}.json"
     top_k_path  = output_dir / f"{safe_label}_top{top_k_exp}.json"
+    embedding_path = output_dir / "embeddings" / f"{ds_path.stem}_{safe_label}_embeddings.npz"
 
     result = {
         "entry_idx":      entry_idx,
@@ -325,6 +357,25 @@ def run_entry(
     with top_k_path.open("w", encoding="utf-8") as f:
         json.dump(top_k_data, f, ensure_ascii=False, indent=2)
     print(f"  Top-{top_k_exp} export saved → {top_k_path}")
+
+    if save_embeddings:
+        save_embedding_export(
+            embedding_path,
+            table_ids=table_ids,
+            query_ids=query_ids,
+            queries=queries,
+            gold_ids=gold_ids,
+            table_embeddings=table_embeddings,
+            query_embeddings=query_embeddings,
+            table_variants=table_variants,
+            metadata={
+                "dataset": ds_name,
+                "dataset_path": str(ds_path),
+                "embedder_label": run_label,
+                "embedder_cfg": emb_cfg,
+            },
+        )
+        print(f"  Embeddings saved → {embedding_path}")
 
     return result
 

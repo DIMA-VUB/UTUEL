@@ -10,15 +10,15 @@ pipeline:
 
 datasets:
   - &rows_dataset
-    name: test_lookup_WikiSQL
-    path: permutation_invariance/datasets/test_lookup_WikiSQL_rows.jsonl
+    name: test_lookup_WikiSQL_rows
+    path: datasets/test_lookup_WikiSQL_rows.jsonl
     model: llama3
     prompt_key: prompt
     prompt_template: prompts_pipeline/prompt_templates/prompt_test_lookup_WikiSQL.txt
   - <<: *rows_dataset
     model: gemma2
   - <<: *rows_dataset
-    model: tablellm-7b-Q4
+    model: tablellm:8b
   - <<: *rows_dataset
     model: qwen3.6:27b
   - <<: *rows_dataset
@@ -28,7 +28,9 @@ datasets:
   - <<: *rows_dataset
     model: TableGPT2-7B
   - <<: *rows_dataset
-    model: gpt-oss
+    model: GPT-OSS
+  - <<: *rows_dataset
+    model: granite4.2
 
 hydra:
   run:

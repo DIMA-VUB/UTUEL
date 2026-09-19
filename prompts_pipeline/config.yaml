@@ -36,7 +36,7 @@ datasets:
   
   - name: test_lookup_WikiSQL
     path: datasets/test_lookup_WikiSQL.jsonl
-    model: tablellm-7b-Q4
+    model: tablellm:8b
     prompt_key: prompt
     prompt_template: prompts_pipeline/prompt_templates/prompt_test_lookup_WikiSQL.txt
   
@@ -66,11 +66,16 @@ datasets:
   
   - name: test_lookup_WikiSQL
     path: datasets/test_lookup_WikiSQL.jsonl
-    model: gpt-oss
+    model: GPT-OSS
     prompt_key: prompt
     prompt_template: prompts_pipeline/prompt_templates/prompt_test_lookup_WikiSQL.txt
 
-
+  - name: test_lookup_WikiSQL
+    path: datasets/test_lookup_WikiSQL.jsonl
+    model: granite4.2
+    prompt_key: prompt
+    prompt_template: prompts_pipeline/prompt_templates/prompt_test_lookup_WikiSQL.txt
+    
 # ── Hydra settings ────────────────────────────────────────────────────────────
 hydra:
   run:

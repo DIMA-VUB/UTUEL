@@ -307,31 +307,42 @@ def evaluate_model(
     _glob_row_tids:  list[str]           = []
     _glob_tbl_parts: list[torch.Tensor]  = []
     _glob_tbl_tids:  list[str]           = []
+    eval_batch_size = int(OmegaConf.select(cfg, "evaluation.batch_size", default=cfg.training.batch_size))
+    if eval_batch_size < 1:
+        raise ValueError("evaluation.batch_size must be at least 1.")
+    print(f"[eval] U-path encoding batch size={eval_batch_size}")
 
     for tid, sample_js in tid_to_sample_js.items():
         ups  = [ds._samples[j][1] for j in sample_js]
         n_up = len(ups)
-        idx_t   = torch.tensor(sample_js, dtype=torch.long)
-        if ds._smp_input_ids is not None:
-            smp_raw = model.embed_cells(
-                ds._smp_input_ids[idx_t].to(device),
-                ds._smp_attention_mask[idx_t].to(device),
-            )
-        else:
-            smp_raw = ds._embed_cache[ds._smp_idx[idx_t]].to(device)
-
         with torch.no_grad():
-            proj = model.input_projection(smp_raw)
             cls_proj = model.input_projection(model.cls_token)
-            cls  = cls_proj.expand(n_up, -1, -1)           # [n, 1, hidden_size]
-            enc, _, _ = model.transformer_encoder(torch.cat([cls, proj], dim=1))
-            na = F.normalize(enc[:, 2, :], dim=-1).cpu()          # [n, d]
+            na_parts: list[torch.Tensor] = []
+            nb_parts: list[torch.Tensor] = []
+            for start in range(0, n_up, eval_batch_size):
+                sample_batch = sample_js[start:start + eval_batch_size]
+                batch_size = len(sample_batch)
+                idx_t = torch.tensor(sample_batch, dtype=torch.long)
+                if ds._smp_input_ids is not None:
+                    smp_raw = model.embed_cells(
+                        ds._smp_input_ids[idx_t].to(device),
+                        ds._smp_attention_mask[idx_t].to(device),
+                    )
+                else:
+                    smp_raw = ds._embed_cache[ds._smp_idx[idx_t]].to(device)
 
-            smp_bar = smp_raw[:, [3, 2, 1, 0], :]
-            proj_b  = model.input_projection(smp_bar)
-            cls_b   = cls_proj.expand(n_up, -1, -1)
-            enc_b, _, _ = model.transformer_encoder(torch.cat([cls_b, proj_b], dim=1))
-            nb = F.normalize(enc_b[:, 2, :], dim=-1).cpu()        # [n, d]
+                proj = model.input_projection(smp_raw)
+                cls = cls_proj.expand(batch_size, -1, -1)
+                enc, _, _ = model.transformer_encoder(torch.cat([cls, proj], dim=1))
+                na_parts.append(F.normalize(enc[:, 2, :], dim=-1).cpu())
+
+                smp_bar = smp_raw[:, [3, 2, 1, 0], :]
+                proj_b = model.input_projection(smp_bar)
+                cls_b = cls_proj.expand(batch_size, -1, -1)
+                enc_b, _, _ = model.transformer_encoder(torch.cat([cls_b, proj_b], dim=1))
+                nb_parts.append(F.normalize(enc_b[:, 2, :], dim=-1).cpu())
+            na = torch.cat(na_parts, dim=0)
+            nb = torch.cat(nb_parts, dim=0)
 
         tid_to_na[tid]  = na
         tid_to_nb[tid]  = nb

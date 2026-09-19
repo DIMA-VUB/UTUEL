@@ -65,6 +65,10 @@ smp:
   num_walks: 50
   chunk_size: 1
 
+# ── Evaluation ─────────────────────────────────────────────────────────────
+evaluation:
+  batch_size: 128  # maximum U-paths encoded together; bounds scratch CLS-attention memory
+
 # ── Training ────────────────────────────────────────────────────────────────
 training:
   mode: global

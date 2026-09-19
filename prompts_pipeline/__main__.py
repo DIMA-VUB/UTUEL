@@ -12,12 +12,17 @@ import asyncio
 import logging
 import os
 from pathlib import Path
+import sys
 
 import hydra
 from dotenv import load_dotenv
 from omegaconf import DictConfig
 
-from .runner import PipelineRunner, DatasetConfig
+if __package__:
+    from .runner import PipelineRunner, DatasetConfig
+else:
+    sys.path.insert(0, str(Path(__file__).parent.parent))
+    from prompts_pipeline.runner import PipelineRunner, DatasetConfig
 
 # Suppress httpx / httpcore / LangChain HTTP INFO chatter so only
 # the pipeline's own progress lines appear in the terminal.
